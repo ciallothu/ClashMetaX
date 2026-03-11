@@ -14,11 +14,19 @@ TrayIcon::~TrayIcon() {
 }
 
 bool TrayIcon::LoadIcons() {
-    // 使用系统预设图标
-    // IDI_INFORMATION = 蓝色信息图标 (开启)
-    // IDI_ERROR = 红色错误图标 (关闭)
-    m_iconEnabled = LoadIcon(NULL, IDI_INFORMATION);
-    m_iconDisabled = LoadIcon(NULL, IDI_ERROR);
+    // 从资源加载自定义图标
+    m_iconEnabled = LoadIconA(GetModuleHandle(NULL), MAKEINTRESOURCEA(IDI_PROXY_ON));
+    m_iconDisabled = LoadIconA(GetModuleHandle(NULL), MAKEINTRESOURCEA(IDI_PROXY_OFF));
+
+    // 如果自定义图标加载失败，使用系统图标作为后备
+    if (m_iconEnabled == NULL) {
+        printf("Warning: Failed to load IDI_PROXY_ON, using system icon\n");
+        m_iconEnabled = LoadIcon(NULL, IDI_INFORMATION);
+    }
+    if (m_iconDisabled == NULL) {
+        printf("Warning: Failed to load IDI_PROXY_OFF, using system icon\n");
+        m_iconDisabled = LoadIcon(NULL, IDI_ERROR);
+    }
 
     return (m_iconEnabled != NULL) && (m_iconDisabled != NULL);
 }

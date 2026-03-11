@@ -9,3 +9,7 @@
 #define IDC_CLEAR_BYPASS 108
 #define IDOK 1
 #define IDCANCEL 2
+
+// Tray icon resources
+#define IDI_PROXY_ON  6001
+#define IDI_PROXY_OFF 6002

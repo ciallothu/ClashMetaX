@@ -23,3 +23,7 @@ BEGIN
     DEFPUSHBUTTON   "OK", IDOK, 100, 142, 70, 14
     PUSHBUTTON      "Cancel", IDCANCEL, 180, 142, 70, 14
 END
+
+// Tray icons (relative to resource.rc)
+IDI_PROXY_ON  ICON "res/icons/proxy-on.ico"
+IDI_PROXY_OFF ICON "res/icons/proxy-off.ico"
