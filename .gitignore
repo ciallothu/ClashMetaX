@@ -2,15 +2,7 @@
 build/
 cmake-build-*/
 dist/
-
-# Visual Studio
-.vs/
-*.vcxproj
-*.vcxproj.filters
-*.sln
-*.suo
-*.user
-*.vcxproj.user
+release/
 
 # Compiled files
 *.exe
@@ -31,18 +23,30 @@ Makefile
 *.cmake
 !CMakeLists.txt
 
+# Temporary files
+.version.tmp
+
 # IDE
+.vs/
 .vscode/
 .idea/
+*.suo
+*.user
+*.vcxproj
+*.vcxproj.filters
+*.sln
 *.swp
 *.swo
 *~
-.claude
-docs
 
 # OS
 .DS_Store
 Thumbs.db
-# pixi environments
+
+# Claude
+.claude
+docs
+
+# pixi
 .pixi/*
 !.pixi/config.toml

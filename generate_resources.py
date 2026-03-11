@@ -40,6 +40,11 @@ def generate_resource_files(dist_dir="dist", output_rc="src/webui.rc", output_h=
     for file_path in dist_path.rglob("*"):
         if file_path.is_file():
             relative_path = file_path.relative_to(dist_path)
+            # Skip version directories (v2.2.0, v2.2.1, etc.)
+            parts = relative_path.parts
+            if len(parts) > 0 and parts[0].startswith('v'):
+                print(f"Skipping version directory: {relative_path}")
+                continue
             files.append(relative_path)
 
     print(f"Found {len(files)} files")

@@ -1,14 +1,14 @@
 # SysProxyBar - Windows系统代理控制工具
 # 编译要求：CMake 3.15+, TDM-GCC 10.3.0 或 Visual Studio 2019+
 cmake_minimum_required(VERSION 3.15)
-project(SysProxyBar VERSION 1.0.0 LANGUAGES CXX)
+project(SysProxyBar VERSION 2.3 LANGUAGES CXX)
 
 # C++17 标准
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 设置输出目录
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+# 设置输出目录为 release/v{VERSION}
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/release/v${PROJECT_VERSION})
 
 # ============== 源文件 ==============
 set(SOURCES
@@ -17,6 +17,7 @@ set(SOURCES
     src/tray_icon.cpp
     src/settings_dialog.cpp
     src/http_server.cpp
+    src/mihomo_manager.cpp
 )
 
 # 头文件
@@ -27,12 +28,15 @@ set(HEADERS
     src/resource.h
     src/http_server.h
     src/webui_resource.h
+    src/mihomo_manager.h
+    src/mihomo_resource.h
 )
 
 # 资源文件（对话框、图标等）
 set(RESOURCES
     src/resource.rc
     src/webui.rc
+    src/mihomo.rc
 )
 
 # 创建可执行文件（Windows GUI程序）

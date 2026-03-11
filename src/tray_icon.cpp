@@ -63,6 +63,10 @@ void TrayIcon::ShowContextMenu() {
     AppendMenuA(hMenu, MF_STRING, IDM_SETTINGS, "设置...");
     AppendMenuA(hMenu, MF_STRING, IDM_AUTOSTART, "开机自启动");
     AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(hMenu, MF_STRING, IDM_OPEN_WEBUI, "打开面板");
+    AppendMenuA(hMenu, MF_STRING, IDM_RESTART_MIHOMO, "重启 Mihomo");
+    AppendMenuA(hMenu, MF_STRING, IDM_OPEN_CONFIG_DIR, "打开配置文件");
+    AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hMenu, MF_STRING, IDM_EXIT, "退出");
 
     SetForegroundWindow(m_hwnd);
@@ -89,6 +93,8 @@ LRESULT TrayIcon::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case IDM_SETTINGS:
         case IDM_AUTOSTART:
         case IDM_OPEN_WEBUI:
+        case IDM_RESTART_MIHOMO:
+        case IDM_OPEN_CONFIG_DIR:
         case IDM_EXIT:
             PostMessage(m_hwnd, WM_COMMAND, wParam, lParam);
             break;

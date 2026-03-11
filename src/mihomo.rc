@@ -1,0 +1,10 @@
+#include "mihomo_resource.h"
+
+// Mihomo Windows executable
+IDR_MIHOMO_EXE MIHOMO "../tools/mihomo/mihomo.exe"
+
+// Mihomo default configuration file
+IDR_MIHOMO_CONFIG MIHOMO "../tools/mihomo/config.yaml"
+
+// Mihomo version string
+IDR_MIHOMO_VERSION MIHOMO "../tools/mihomo/mihomo.version"

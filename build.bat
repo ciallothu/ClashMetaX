@@ -5,94 +5,104 @@ echo SysProxyBar Build Script
 echo ========================================
 echo.
 
-REM Auto-detect TDM-GCC
-set "TDM_GCC="
-
-REM Check Scoop path
-if exist "D:\env\Scoop\apps\tdm-gcc\10.3.0\bin\gcc.exe" (
-    set "TDM_GCC=D:\env\Scoop\apps\tdm-gcc\10.3.0\bin"
-    goto :found
+REM ========================================
+REM Step 1: Read version from CMakeLists.txt
+REM ========================================
+echo Reading version...
+for /f "tokens=3" %%V in ('type CMakeLists.txt ^| findstr /C:"project" ^| findstr /C:"VERSION"') do (
+    set "VERSION=%%V"
+    goto :version_found
 )
+:version_found
 
-echo ERROR: TDM-GCC not found at default path
-echo.
-echo Please install TDM-GCC:
-echo   scoop install tdm-gcc
-echo.
-pause
-exit /b 1
-
-:found
-echo Found TDM-GCC at: %TDM_GCC%
+if "!VERSION!"=="" (
+    echo ERROR: Failed to read version from CMakeLists.txt
+    pause
+    exit /b 1
+)
+echo Version: !VERSION!
 echo.
 
-REM Generate WebUI resource files
+REM ========================================
+REM Step 2: Detect TDM-GCC
+REM ========================================
+set "TDM_GCC=D:\env\Scoop\apps\tdm-gcc\10.3.0\bin"
+
+if not exist "!TDM_GCC!\gcc.exe" (
+    echo ERROR: TDM-GCC not found at !TDM_GCC!
+    echo Please install: scoop install tdm-gcc
+    pause
+    exit /b 1
+)
+echo Found TDM-GCC
+echo.
+
+REM ========================================
+REM Step 3: Generate WebUI resources
+REM ========================================
 echo Generating WebUI resources...
 pixi run python generate_resources.py
 if errorlevel 1 (
-    echo.
     echo Failed to generate resources!
     pause
     exit /b 1
 )
 echo.
 
-REM Check version
-"%TDM_GCC%\gcc.exe" --version | findstr "gcc"
-echo.
+REM ========================================
+REM Step 4: Build project
+REM ========================================
+echo Building...
 
-REM Create build directory
+REM Use forward slashes for CMake paths
+set "GCC_EXE=D:/env/Scoop/apps/tdm-gcc/10.3.0/bin/g++.exe"
+set "MAKE_EXE=D:/env/Scoop/apps/tdm-gcc/10.3.0/bin/mingw32-make.exe"
+set "WINDRES_EXE=D:/env/Scoop/apps/tdm-gcc/10.3.0/bin/windres.exe"
+
 if not exist build mkdir build
 cd build
-
-REM Clean old build
 if exist CMakeCache.txt del /Q CMakeCache.txt
 
-echo Configuring project...
-set "GCC_EXE=%TDM_GCC%\g++.exe"
-set "MAKE_EXE=%TDM_GCC%\mingw32-make.exe"
-set "WINDRES_EXE=%TDM_GCC%\windres.exe"
-
-REM Convert backslashes to forward slashes for CMake
-set "GCC_EXE=!GCC_EXE:\=/!"
-set "MAKE_EXE=!MAKE_EXE:\=/!"
-set "WINDRES_EXE=!WINDRES_EXE:\=/!"
-
-cmake .. -G "MinGW Makefiles" -DCMAKE_CXX_COMPILER="!GCC_EXE!" -DCMAKE_MAKE_PROGRAM="!MAKE_EXE!" -DCMAKE_RC_COMPILER="!WINDRES_EXE!" -DCMAKE_BUILD_TYPE=Release
+cmake .. -G "MinGW Makefiles" -DCMAKE_CXX_COMPILER="%GCC_EXE%" -DCMAKE_MAKE_PROGRAM="%MAKE_EXE%" -DCMAKE_RC_COMPILER="%WINDRES_EXE%" -DCMAKE_BUILD_TYPE=Release
 
 if errorlevel 1 (
-    echo.
     echo Configuration FAILED!
     cd ..
     pause
     exit /b 1
 )
 
-echo.
-echo Compiling...
 "%TDM_GCC%\mingw32-make.exe"
-
 if errorlevel 1 (
-    echo.
     echo Build FAILED!
     cd ..
     pause
     exit /b 1
 )
 
-echo.
-echo ========================================
-echo Build SUCCESS!
-echo ========================================
-echo.
-if exist bin\SysProxyBar.exe (
-    echo Output: build\bin\SysProxyBar.exe
-    dir bin\SysProxyBar.exe | findstr "SysProxyBar.exe"
-)
-echo.
-echo You can now run SysProxyBar.exe
-echo ========================================
-echo.
 cd ..
+echo Build complete!
+echo.
+
+REM ========================================
+REM Step 5: Verify output
+REM ========================================
+set "OUTPUT_DIR=release\v!VERSION!"
+
+if exist "!OUTPUT_DIR!\SysProxyBar.exe" (
+    echo.
+    echo ========================================
+    echo SUCCESS!
+    echo ========================================
+    echo Version: !VERSION!
+    echo Output: !OUTPUT_DIR!\SysProxyBar.exe
+    dir "!OUTPUT_DIR!\SysProxyBar.exe" | findstr "SysProxyBar.exe"
+    echo ========================================
+) else (
+    echo ERROR: Output not found at !OUTPUT_DIR!\SysProxyBar.exe
+)
+
+echo.
+
 endlocal
 pause

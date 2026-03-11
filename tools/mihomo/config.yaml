@@ -1,0 +1,34 @@
+# Mihomo minimal configuration for SysProxyBar
+# Port settings
+port: 7890
+socks-port: 7891
+allow-lan: true
+mode: rule
+log-level: info
+
+# External controller (for WebUI)
+external-controller: 127.0.0.1:9090
+
+# DNS configuration
+dns:
+  enable: true
+  listen: 0.0.0.0:53
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+
+# Proxy list (configure this or use external config)
+proxies: []
+
+# Proxy groups
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies:
+      - DIRECT
+
+# Rules
+rules:
+  - MATCH,PROXY

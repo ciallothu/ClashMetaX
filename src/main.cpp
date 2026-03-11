@@ -2,11 +2,13 @@
 #include "tray_icon.h"
 #include "settings_dialog.h"
 #include "http_server.h"
+#include "mihomo_manager.h"
 #include <string>
 
 // 全局变量
 TrayIcon* g_trayIcon = nullptr;
 HTTPServer* g_httpServer = nullptr;
+MihomoManager* g_mihomoManager = nullptr;
 std::string g_proxyServer = "127.0.0.1";
 int g_proxyPort = 7890;
 std::string g_proxyBypass = "localhost;127.*;<local>";
@@ -19,9 +21,11 @@ bool SetAutoStart(bool enable) {
     }
 
     if (enable) {
+        // 获取当前正在运行的 exe 路径（而不是固定路径）
         char exePath[MAX_PATH];
         GetModuleFileNameA(NULL, exePath, MAX_PATH);
 
+        // 每次都写入当前路径，这样版本更新后会自动指向新版本
         if (RegSetValueExA(hKey, "SysProxyBar", 0, REG_SZ, (const BYTE*)exePath, strlen(exePath) + 1) != ERROR_SUCCESS) {
             RegCloseKey(hKey);
             return false;
@@ -86,6 +90,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 
         // 初始化图标状态
         g_trayIcon->Update(ProxyManager::IsProxyEnabled());
+
+        // 初始化并启动 mihomo
+        g_mihomoManager = new MihomoManager();
+        if (!g_mihomoManager->Initialize()) {
+            MessageBoxA(hwnd, "Mihomo 初始化失败", "警告", MB_OK | MB_ICONWARNING);
+        } else if (!g_mihomoManager->Start()) {
+            MessageBoxA(hwnd, "Mihomo 启动失败", "警告", MB_OK | MB_ICONWARNING);
+        }
         break;
 
     case WM_TRAY_ICON:
@@ -113,8 +125,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             bool currentState = IsAutoStartEnabled();
             bool newState = !currentState;
             if (SetAutoStart(newState)) {
-                const char* message = newState ? "开机自启动已启用" : "开机自启动已禁用";
-                MessageBoxA(hwnd, message, "系统代理", MB_OK | MB_ICONINFORMATION);
+                char currentExe[MAX_PATH];
+                GetModuleFileNameA(NULL, currentExe, MAX_PATH);
+                if (newState) {
+                    char message[512];
+                    sprintf_s(message, sizeof(message),
+                        "开机自启动已启用\n\n启动路径: %s\n\n注意: 更新版本后会自动指向新版本",
+                        currentExe);
+                    MessageBoxA(hwnd, message, "系统代理", MB_OK | MB_ICONINFORMATION);
+                } else {
+                    MessageBoxA(hwnd, "开机自启动已禁用", "系统代理", MB_OK | MB_ICONINFORMATION);
+                }
             } else {
                 MessageBoxA(hwnd, "设置开机自启动失败", "错误", MB_OK | MB_ICONERROR);
             }
@@ -153,17 +174,50 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             break;
         }
 
+        case IDM_RESTART_MIHOMO: {
+            if (g_mihomoManager) {
+                if (g_mihomoManager->Restart()) {
+                    MessageBoxA(hwnd, "Mihomo 已重启", "成功", MB_OK | MB_ICONINFORMATION);
+                } else {
+                    MessageBoxA(hwnd, "Mihomo 重启失败", "错误", MB_OK | MB_ICONERROR);
+                }
+            }
+            break;
+        }
+
+        case IDM_OPEN_CONFIG_DIR: {
+            if (g_mihomoManager) {
+                std::string configPath = g_mihomoManager->GetConfigPath();
+                if (!configPath.empty()) {
+                    // Select the config file in explorer
+                    ShellExecuteA(NULL, "open", "explorer.exe", ("/select," + configPath).c_str(), NULL, SW_SHOW);
+                } else {
+                    MessageBoxA(hwnd, "无法获取配置文件路径", "错误", MB_OK | MB_ICONERROR);
+                }
+            }
+            break;
+        }
+
         case IDM_EXIT:
-            PostQuitMessage(0);
+            // Destroy window first (triggers WM_DESTROY for cleanup)
+            DestroyWindow(hwnd);
             break;
         }
         break;
 
     case WM_DESTROY:
+        // 停止 mihomo
+        if (g_mihomoManager) {
+            g_mihomoManager->Stop();
+            delete g_mihomoManager;
+            g_mihomoManager = nullptr;
+        }
+        // 清理托盘图标
         if (g_trayIcon) {
             delete g_trayIcon;
             g_trayIcon = nullptr;
         }
+        // 清理 HTTP 服务器
         if (g_httpServer) {
             delete g_httpServer;
             g_httpServer = nullptr;
@@ -179,6 +233,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 
 // 主函数
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    // 单实例检查
+    const char* mutexName = "Global\\SysProxyBar_SingleInstance_Mutex";
+    HANDLE hMutex = CreateMutexA(NULL, TRUE, mutexName);
+
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        // 已经有一个实例在运行
+        MessageBoxA(NULL, "SysProxyBar 已经在运行中", "提示", MB_OK | MB_ICONINFORMATION);
+        if (hMutex) CloseHandle(hMutex);
+        return 0;
+    }
+
     // 加载配置
     LoadConfig();
 
@@ -198,8 +263,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.hIconSm = NULL;
 
     if (!RegisterClassExA(&wc)) {
-        MessageBoxA(NULL, "窗口类注册失败", "错误", MB_ICONERROR);
-        return 1;
+        // 如果类已注册，可能是上次崩溃残留
+        if (GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            MessageBoxA(NULL, "窗口类注册失败", "错误", MB_ICONERROR);
+            if (hMutex) CloseHandle(hMutex);
+            return 1;
+        }
     }
 
     // 创建隐藏窗口
@@ -214,6 +283,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     if (!hwnd) {
         MessageBoxA(NULL, "窗口创建失败", "错误", MB_ICONERROR);
+        if (hMutex) CloseHandle(hMutex);
         return 1;
     }
 
@@ -223,6 +293,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
+
+    // 清理互斥体
+    if (hMutex) CloseHandle(hMutex);
 
     return (int)msg.wParam;
 }
