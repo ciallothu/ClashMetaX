@@ -37,6 +37,10 @@ public:
     // Check if process is running
     bool IsRunning() const;
 
+    // TUN mode helpers
+    bool IsTunEnabled() const;
+    bool SetTunEnabled(bool enable);
+
     // Get paths
     std::string GetWorkingDirectory() const { return m_workDir; }
     std::string GetExecutablePath() const { return m_exePath; }
@@ -79,6 +83,9 @@ private:
 
     // Stop any stale mihomo.exe process using the managed work directory
     bool StopManagedMihomoProcesses();
+
+    // Update tun.enable in the runtime config file
+    bool UpdateTunConfig(bool enable);
 
 private:
     PROCESS_INFORMATION m_processInfo;

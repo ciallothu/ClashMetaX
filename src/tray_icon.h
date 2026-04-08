@@ -15,6 +15,7 @@
 #define IDM_RESTART_MIHOMO 2006
 #define IDM_UPDATE_MIHOMO 2007
 #define IDM_OPEN_CONFIG_DIR 2008
+#define IDM_TOGGLE_TUN 2009
 
 class TrayIcon {
 public:
@@ -24,6 +25,7 @@ public:
     bool Add();
     bool Remove();
     bool Update(bool proxyEnabled);
+    void SetTunEnabled(bool tunEnabled);
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
 
 private:
@@ -31,6 +33,7 @@ private:
     NOTIFYICONDATAA m_nid;
     HICON m_iconEnabled;
     HICON m_iconDisabled;
+    bool m_tunEnabled;
 
     bool LoadIcons();
     void ShowContextMenu();

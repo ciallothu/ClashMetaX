@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <io.h>
 #include <process.h>
+#include <fstream>
+#include <sstream>
+#include <vector>
 #include <tlhelp32.h>
 
 #pragma comment(lib, "shell32.lib")
@@ -29,6 +32,30 @@ MihomoManager::~MihomoManager() {
 
 bool MihomoManager::FileExists(const std::string& path) const {
     return (_access(path.c_str(), 0) == 0);
+}
+
+namespace {
+std::string TrimLeft(const std::string& value) {
+    size_t start = value.find_first_not_of(" \t");
+    return (start == std::string::npos) ? "" : value.substr(start);
+}
+
+std::string Trim(const std::string& value) {
+    size_t start = value.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) {
+        return "";
+    }
+    size_t end = value.find_last_not_of(" \t\r\n");
+    return value.substr(start, end - start + 1);
+}
+
+size_t IndentWidth(const std::string& value) {
+    size_t indent = 0;
+    while (indent < value.size() && (value[indent] == ' ' || value[indent] == '\t')) {
+        indent++;
+    }
+    return indent;
+}
 }
 
 bool MihomoManager::StopManagedMihomoProcesses() {
@@ -214,6 +241,139 @@ std::string MihomoManager::GetInstalledMihomoVersion() {
 
     buffer[bytesRead] = '\0';
     return std::string(buffer);
+}
+
+bool MihomoManager::IsTunEnabled() const {
+    std::ifstream configFile(m_configPath.c_str(), std::ios::in);
+    if (!configFile.is_open()) {
+        return false;
+    }
+
+    std::string line;
+    bool inTunSection = false;
+    size_t tunIndent = 0;
+
+    while (std::getline(configFile, line)) {
+        std::string trimmed = TrimLeft(line);
+        size_t indent = IndentWidth(line);
+
+        if (!inTunSection) {
+            if (trimmed == "tun:") {
+                inTunSection = true;
+                tunIndent = indent;
+            }
+            continue;
+        }
+
+        if (!trimmed.empty() && trimmed[0] != '#' && indent <= tunIndent) {
+            break;
+        }
+
+        if (indent > tunIndent && trimmed.rfind("enable:", 0) == 0) {
+            std::string value = Trim(trimmed.substr(7));
+            return value == "true";
+        }
+    }
+
+    return false;
+}
+
+bool MihomoManager::UpdateTunConfig(bool enable) {
+    std::ifstream configFile(m_configPath.c_str(), std::ios::in);
+    if (!configFile.is_open()) {
+        printf("ERROR: Failed to open config file: %s\n", m_configPath.c_str());
+        return false;
+    }
+
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(configFile, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        lines.push_back(line);
+    }
+    configFile.close();
+
+    bool inTunSection = false;
+    bool updated = false;
+    size_t tunIndent = 0;
+
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const std::string& currentLine = lines[i];
+        std::string trimmed = TrimLeft(currentLine);
+        size_t indent = IndentWidth(currentLine);
+
+        if (!inTunSection) {
+            if (trimmed == "tun:") {
+                inTunSection = true;
+                tunIndent = indent;
+            }
+            continue;
+        }
+
+        if (!trimmed.empty() && trimmed[0] != '#' && indent <= tunIndent) {
+            break;
+        }
+
+        if (indent > tunIndent && trimmed.rfind("enable:", 0) == 0) {
+            lines[i] = std::string(indent, ' ') + "enable: " + (enable ? "true" : "false");
+            updated = true;
+            break;
+        }
+    }
+
+    if (!updated) {
+        if (!lines.empty() && !lines.back().empty()) {
+            lines.push_back("");
+        }
+        lines.push_back("tun:");
+        lines.push_back(std::string(2, ' ') + "enable: " + (enable ? "true" : "false"));
+        lines.push_back("  stack: mixed");
+        lines.push_back("  dns-hijack:");
+        lines.push_back("    - 'any:53'");
+        lines.push_back("    - 'tcp://any:53'");
+        lines.push_back("  auto-route: true");
+        lines.push_back("  auto-detect-interface: true");
+        lines.push_back("  strict-route: true");
+    }
+
+    std::ofstream outputFile(m_configPath.c_str(), std::ios::out | std::ios::trunc);
+    if (!outputFile.is_open()) {
+        printf("ERROR: Failed to write config file: %s\n", m_configPath.c_str());
+        return false;
+    }
+
+    for (size_t i = 0; i < lines.size(); ++i) {
+        outputFile << lines[i] << "\n";
+    }
+
+    return outputFile.good();
+}
+
+bool MihomoManager::SetTunEnabled(bool enable) {
+    if (!FileExists(m_configPath)) {
+        if (!ExtractDefaultConfig()) {
+            return false;
+        }
+    }
+
+    bool current = IsTunEnabled();
+    if (current == enable) {
+        return true;
+    }
+
+    if (!UpdateTunConfig(enable)) {
+        return false;
+    }
+
+    printf("TUN mode %s\n", enable ? "enabled" : "disabled");
+
+    if (IsRunning()) {
+        return Restart();
+    }
+
+    return Start();
 }
 
 bool MihomoManager::IsMihomoUpdateNeeded() {

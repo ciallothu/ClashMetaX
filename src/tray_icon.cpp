@@ -2,7 +2,7 @@
 #include "resource.h"
 #include <stdio.h>
 
-TrayIcon::TrayIcon(HWND hwnd) : m_hwnd(hwnd), m_iconEnabled(NULL), m_iconDisabled(NULL) {
+TrayIcon::TrayIcon(HWND hwnd) : m_hwnd(hwnd), m_iconEnabled(NULL), m_iconDisabled(NULL), m_tunEnabled(false) {
     ZeroMemory(&m_nid, sizeof(m_nid));
     LoadIcons();
 }
@@ -61,12 +61,17 @@ bool TrayIcon::Update(bool proxyEnabled) {
     return Shell_NotifyIconA(NIM_MODIFY, &m_nid) != FALSE;
 }
 
+void TrayIcon::SetTunEnabled(bool tunEnabled) {
+    m_tunEnabled = tunEnabled;
+}
+
 void TrayIcon::ShowContextMenu() {
     POINT pt;
     GetCursorPos(&pt);
 
     HMENU hMenu = CreatePopupMenu();
     AppendMenuA(hMenu, MF_STRING, IDM_TOGGLE_PROXY, "切换代理");
+    AppendMenuA(hMenu, MF_STRING | (m_tunEnabled ? MF_CHECKED : MF_UNCHECKED), IDM_TOGGLE_TUN, "TUN Mode");
     AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hMenu, MF_STRING, IDM_SETTINGS, "设置...");
     AppendMenuA(hMenu, MF_STRING, IDM_AUTOSTART, "开机自启动");
@@ -98,6 +103,7 @@ LRESULT TrayIcon::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case IDM_TOGGLE_PROXY:
+        case IDM_TOGGLE_TUN:
         case IDM_SETTINGS:
         case IDM_AUTOSTART:
         case IDM_OPEN_WEBUI:

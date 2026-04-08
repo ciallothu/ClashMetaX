@@ -13,6 +13,42 @@ std::string g_proxyServer = "127.0.0.1";
 int g_proxyPort = 7890;
 std::string g_proxyBypass = "localhost;127.*;<local>";
 
+bool IsRunningAsAdmin() {
+    BOOL isAdmin = FALSE;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    PSID adminGroup = NULL;
+
+    if (AllocateAndInitializeSid(&ntAuthority, 2,
+                                 SECURITY_BUILTIN_DOMAIN_RID,
+                                 DOMAIN_ALIAS_RID_ADMINS,
+                                 0, 0, 0, 0, 0, 0,
+                                 &adminGroup)) {
+        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+
+    return isAdmin == TRUE;
+}
+
+bool RelaunchAsAdmin() {
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+
+    HINSTANCE result = ShellExecuteA(NULL, "runas", exePath, NULL, NULL, SW_SHOWNORMAL);
+    return reinterpret_cast<INT_PTR>(result) > 32;
+}
+
+void UpdateTrayState() {
+    if (!g_trayIcon) {
+        return;
+    }
+
+    g_trayIcon->Update(ProxyManager::IsProxyEnabled());
+    if (g_mihomoManager) {
+        g_trayIcon->SetTunEnabled(g_mihomoManager->IsTunEnabled());
+    }
+}
+
 // 设置开机自启动
 bool SetAutoStart(bool enable) {
     HKEY hKey;
@@ -89,7 +125,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         }
 
         // 初始化图标状态
-        g_trayIcon->Update(ProxyManager::IsProxyEnabled());
+        UpdateTrayState();
 
         // 初始化并启动 mihomo
         g_mihomoManager = new MihomoManager();
@@ -98,6 +134,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         } else if (!g_mihomoManager->Start()) {
             MessageBoxA(hwnd, "Mihomo 启动失败", "警告", MB_OK | MB_ICONWARNING);
         }
+        UpdateTrayState();
         break;
 
     case WM_TRAY_ICON:
@@ -111,6 +148,26 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case IDM_TOGGLE_PROXY:
             ToggleProxy();
             break;
+
+        case IDM_TOGGLE_TUN: {
+            if (!g_mihomoManager) {
+                MessageBoxA(hwnd, "Mihomo 管理器未初始化", "错误", MB_OK | MB_ICONERROR);
+                break;
+            }
+
+            bool enableTun = !g_mihomoManager->IsTunEnabled();
+            if (g_mihomoManager->SetTunEnabled(enableTun)) {
+                UpdateTrayState();
+                MessageBoxA(hwnd,
+                    enableTun ? "TUN Mode 已开启，Mihomo 已重启" : "TUN Mode 已关闭，Mihomo 已重启",
+                    "成功", MB_OK | MB_ICONINFORMATION);
+            } else {
+                MessageBoxA(hwnd,
+                    enableTun ? "TUN Mode 开启失败" : "TUN Mode 关闭失败",
+                    "错误", MB_OK | MB_ICONERROR);
+            }
+            break;
+        }
 
         case IDM_SETTINGS: {
             if (SettingsDialog::Show(hwnd, g_proxyServer, g_proxyPort, g_proxyBypass)) {
@@ -233,6 +290,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 
 // 主函数
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    if (!IsRunningAsAdmin()) {
+        if (RelaunchAsAdmin()) {
+            return 0;
+        }
+
+        MessageBoxA(NULL,
+            "SysProxyBar 需要管理员权限启动，以支持 TUN Mode 和相关网络配置。",
+            "需要管理员权限", MB_OK | MB_ICONWARNING);
+        return 1;
+    }
+
     // 单实例检查
     const char* mutexName = "Global\\SysProxyBar_SingleInstance_Mutex";
     HANDLE hMutex = CreateMutexA(NULL, TRUE, mutexName);
