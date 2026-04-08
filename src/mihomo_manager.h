@@ -77,6 +77,9 @@ private:
     // Check if file exists
     bool FileExists(const std::string& path) const;
 
+    // Stop any stale mihomo.exe process using the managed work directory
+    bool StopManagedMihomoProcesses();
+
 private:
     PROCESS_INFORMATION m_processInfo;
     HANDLE m_monitorThread;

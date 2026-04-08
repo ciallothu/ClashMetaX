@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <io.h>
 #include <process.h>
+#include <tlhelp32.h>
 
 #pragma comment(lib, "shell32.lib")
 
@@ -28,6 +29,63 @@ MihomoManager::~MihomoManager() {
 
 bool MihomoManager::FileExists(const std::string& path) const {
     return (_access(path.c_str(), 0) == 0);
+}
+
+bool MihomoManager::StopManagedMihomoProcesses() {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        printf("WARNING: Failed to enumerate processes (error: %lu)\n", GetLastError());
+        return false;
+    }
+
+    bool stoppedAny = false;
+    int widePathLength = MultiByteToWideChar(CP_ACP, 0, m_exePath.c_str(), -1, NULL, 0);
+    std::wstring managedExePath;
+    if (widePathLength > 0) {
+        managedExePath.resize(widePathLength);
+        MultiByteToWideChar(CP_ACP, 0, m_exePath.c_str(), -1, &managedExePath[0], widePathLength);
+        if (!managedExePath.empty() && managedExePath.back() == L'\0') {
+            managedExePath.pop_back();
+        }
+    }
+
+    PROCESSENTRY32 pe;
+    pe.dwSize = sizeof(pe);
+
+    if (Process32First(snapshot, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, L"mihomo.exe") != 0) {
+                continue;
+            }
+
+            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
+            if (process == NULL) {
+                continue;
+            }
+
+            wchar_t processPath[MAX_PATH];
+            DWORD processPathSize = MAX_PATH;
+            bool shouldStop = false;
+            if (!managedExePath.empty() && QueryFullProcessImageNameW(process, 0, processPath, &processPathSize)) {
+                shouldStop = (_wcsicmp(processPath, managedExePath.c_str()) == 0);
+            }
+
+            if (shouldStop) {
+                printf("Stopping stale mihomo process (PID: %lu)\n", pe.th32ProcessID);
+                if (TerminateProcess(process, 0)) {
+                    WaitForSingleObject(process, 5000);
+                    stoppedAny = true;
+                } else {
+                    printf("WARNING: Failed to terminate stale mihomo process (error: %lu)\n", GetLastError());
+                }
+            }
+
+            CloseHandle(process);
+        } while (Process32Next(snapshot, &pe));
+    }
+
+    CloseHandle(snapshot);
+    return stoppedAny;
 }
 
 bool MihomoManager::EnsureDirectoryExists(const std::string& path) {
@@ -193,6 +251,10 @@ bool MihomoManager::ExtractMihomoExe() {
     if (!IsMihomoUpdateNeeded()) {
         return true;
     }
+
+    // A stale mihomo.exe from an older build can keep the target file locked and
+    // block replacement during initialization.
+    StopManagedMihomoProcesses();
 
     printf("Extracting mihomo.exe...\n");
     if (!ExtractResource(IDR_MIHOMO_EXE, "MIHOMO", m_exePath)) {

@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path
 
 # Mihomo version to download
-MIHOMO_VERSION = "v1.19.21"
+MIHOMO_VERSION = "v1.19.23"
 MIHOMO_URL = f"https://github.com/MetaCubeX/mihomo/releases/download/{MIHOMO_VERSION}/mihomo-windows-amd64-v3-{MIHOMO_VERSION}.zip"
 OUTPUT_DIR = Path("tools/mihomo")
 
@@ -60,20 +60,25 @@ def find_and_rename_mihomo_exe(search_dir):
     """Find mihomo.exe in the directory and rename it if needed"""
     print("Locating mihomo.exe...")
 
-    # Search for .exe files
-    exe_files = list(search_dir.rglob("*.exe"))
+    target_exe = search_dir / "mihomo.exe"
+
+    # Search for extracted .exe files, preferring a newly extracted binary over an
+    # existing target file so repeated runs stay idempotent on Windows.
+    exe_files = sorted(search_dir.rglob("*.exe"))
+    candidate_exes = [exe for exe in exe_files if exe != target_exe]
 
     if not exe_files:
         print("ERROR: No .exe file found in extracted archive")
         return False
 
-    # Use the first .exe file found
-    source_exe = exe_files[0]
-    target_exe = search_dir / "mihomo.exe"
+    if candidate_exes:
+        source_exe = candidate_exes[0]
+    else:
+        source_exe = target_exe
 
     if source_exe != target_exe:
         print(f"Renaming: {source_exe.name} -> mihomo.exe")
-        source_exe.rename(target_exe)
+        source_exe.replace(target_exe)
 
     print(f"Mihomo executable: {target_exe}")
 
@@ -142,6 +147,19 @@ rules:
         return False
 
 
+def write_version_file(dest_dir, version):
+    """Write mihomo.version for embedding and runtime version checks"""
+    version_path = dest_dir / "mihomo.version"
+
+    try:
+        version_path.write_text(f"{version}\n", encoding="utf-8")
+        print(f"Version file updated: {version_path} -> {version}")
+        return True
+    except Exception as e:
+        print(f"Failed to write version file: {e}")
+        return False
+
+
 def main():
     """Main function"""
     print("=" * 60)
@@ -168,6 +186,10 @@ def main():
 
     # Create default config
     if not create_default_config(OUTPUT_DIR):
+        return 1
+
+    # Update version marker
+    if not write_version_file(OUTPUT_DIR, MIHOMO_VERSION):
         return 1
 
     # Clean up zip file
