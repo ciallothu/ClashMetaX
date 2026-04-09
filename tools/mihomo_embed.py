@@ -9,6 +9,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+from generate_mihomo_manifest import generate_manifest
+
 # Mihomo version to download
 MIHOMO_VERSION = "v1.19.23"
 MIHOMO_URL = f"https://github.com/MetaCubeX/mihomo/releases/download/{MIHOMO_VERSION}/mihomo-windows-amd64-v3-{MIHOMO_VERSION}.zip"
@@ -145,21 +147,6 @@ rules:
     except Exception as e:
         print(f"Failed to create config: {e}")
         return False
-
-
-def write_version_file(dest_dir, version):
-    """Write mihomo.version for embedding and runtime version checks"""
-    version_path = dest_dir / "mihomo.version"
-
-    try:
-        version_path.write_text(f"{version}\n", encoding="utf-8")
-        print(f"Version file updated: {version_path} -> {version}")
-        return True
-    except Exception as e:
-        print(f"Failed to write version file: {e}")
-        return False
-
-
 def main():
     """Main function"""
     print("=" * 60)
@@ -188,9 +175,17 @@ def main():
     if not create_default_config(OUTPUT_DIR):
         return 1
 
-    # Update version marker
-    if not write_version_file(OUTPUT_DIR, MIHOMO_VERSION):
+    try:
+        manifest_path = generate_manifest(OUTPUT_DIR, MIHOMO_VERSION)
+        print(f"Manifest updated: {manifest_path}")
+    except Exception as e:
+        print(f"Failed to generate manifest: {e}")
         return 1
+
+    legacy_version_path = OUTPUT_DIR / "mihomo.version"
+    if legacy_version_path.exists():
+        legacy_version_path.unlink()
+        print(f"Removed legacy file: {legacy_version_path}")
 
     # Clean up zip file
     print()
@@ -204,6 +199,7 @@ def main():
     print(f"Files ready in: {OUTPUT_DIR.absolute()}")
     print("  - mihomo.exe")
     print("  - config.yaml")
+    print("  - mihomo.manifest")
     print()
     print("You can now build the project with:")
     print("  build_versioned.bat")

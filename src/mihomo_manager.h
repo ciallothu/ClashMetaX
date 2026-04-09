@@ -47,17 +47,37 @@ public:
     std::string GetConfigPath() const { return m_configPath; }
 
 private:
+    struct MihomoManifest {
+        std::string version;
+        unsigned long long size;
+        std::string sha256;
+
+        MihomoManifest() : size(0) {}
+    };
+
     // Extract mihomo.exe from resources
     bool ExtractMihomoExe();
 
     // Check if mihomo update is needed
     bool IsMihomoUpdateNeeded();
 
-    // Get current mihomo version from resource
+    // Load embedded manifest metadata
+    bool LoadEmbeddedMihomoManifest();
+
+    // Get current mihomo version from manifest
     std::string GetEmbeddedMihomoVersion();
 
-    // Get installed mihomo version from file
-    std::string GetInstalledMihomoVersion();
+    // Get embedded mihomo.exe SHA-256 from manifest
+    std::string GetEmbeddedMihomoHash();
+
+    // Get embedded mihomo.exe size from manifest
+    unsigned long long GetEmbeddedMihomoSize();
+
+    // Get installed mihomo.exe SHA-256
+    std::string GetInstalledMihomoHash();
+
+    // Get installed mihomo.exe size
+    bool GetInstalledMihomoSize(unsigned long long* size);
 
     // Extract default config.yaml from resources
     bool ExtractDefaultConfig();
@@ -95,4 +115,6 @@ private:
     std::string m_workDir;
     std::string m_exePath;
     std::string m_configPath;
+    bool m_manifestLoaded;
+    MihomoManifest m_manifest;
 };

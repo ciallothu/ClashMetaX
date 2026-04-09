@@ -38,7 +38,19 @@ echo Found TDM-GCC
 echo.
 
 REM ========================================
-REM Step 3: Generate WebUI resources
+REM Step 3: Generate Mihomo manifest
+REM ========================================
+echo Generating Mihomo manifest...
+pixi run python tools/generate_mihomo_manifest.py
+if errorlevel 1 (
+    echo Failed to generate Mihomo manifest!
+    pause
+    exit /b 1
+)
+echo.
+
+REM ========================================
+REM Step 4: Generate WebUI resources
 REM ========================================
 echo Generating WebUI resources...
 pixi run python generate_resources.py
@@ -50,7 +62,7 @@ if errorlevel 1 (
 echo.
 
 REM ========================================
-REM Step 4: Build project
+REM Step 5: Build project
 REM ========================================
 echo Building...
 
@@ -85,7 +97,7 @@ echo Build complete!
 echo.
 
 REM ========================================
-REM Step 5: Verify output
+REM Step 6: Verify output
 REM ========================================
 set "OUTPUT_DIR=release\v!VERSION!"
 

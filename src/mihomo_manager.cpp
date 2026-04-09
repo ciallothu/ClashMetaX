@@ -1,8 +1,10 @@
 #include "mihomo_manager.h"
 #include "mihomo_resource.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <io.h>
 #include <process.h>
+#include <wincrypt.h>
 #include <fstream>
 #include <sstream>
 #include <vector>
@@ -14,6 +16,7 @@ MihomoManager::MihomoManager()
     : m_monitorThread(NULL)
     , m_initialized(false)
     , m_shouldMonitor(false)
+    , m_manifestLoaded(false)
 {
     ZeroMemory(&m_processInfo, sizeof(m_processInfo));
 
@@ -49,12 +52,151 @@ std::string Trim(const std::string& value) {
     return value.substr(start, end - start + 1);
 }
 
+std::string ToLowerAscii(const std::string& value) {
+    std::string lowered = value;
+    for (size_t i = 0; i < lowered.size(); ++i) {
+        if (lowered[i] >= 'A' && lowered[i] <= 'Z') {
+            lowered[i] = static_cast<char>(lowered[i] - 'A' + 'a');
+        }
+    }
+    return lowered;
+}
+
 size_t IndentWidth(const std::string& value) {
     size_t indent = 0;
     while (indent < value.size() && (value[indent] == ' ' || value[indent] == '\t')) {
         indent++;
     }
     return indent;
+}
+
+bool LoadResourceData(int resourceId, const char* resourceType, const void** data, DWORD* size) {
+    if (data == NULL || size == NULL) {
+        return false;
+    }
+
+    HMODULE hModule = GetModuleHandle(NULL);
+    HRSRC hRes = FindResourceA(hModule, MAKEINTRESOURCEA(resourceId), resourceType);
+    if (hRes == NULL) {
+        return false;
+    }
+
+    HGLOBAL hLoaded = LoadResource(hModule, hRes);
+    if (hLoaded == NULL) {
+        return false;
+    }
+
+    void* pData = LockResource(hLoaded);
+    DWORD resourceSize = SizeofResource(hModule, hRes);
+    if (pData == NULL || resourceSize == 0) {
+        return false;
+    }
+
+    *data = pData;
+    *size = resourceSize;
+    return true;
+}
+
+std::string BytesToHex(const BYTE* data, DWORD size) {
+    static const char kHexChars[] = "0123456789abcdef";
+    std::string hex;
+    hex.resize(size * 2);
+
+    for (DWORD i = 0; i < size; ++i) {
+        hex[i * 2] = kHexChars[(data[i] >> 4) & 0x0F];
+        hex[i * 2 + 1] = kHexChars[data[i] & 0x0F];
+    }
+
+    return hex;
+}
+
+std::string FinalizeHash(HCRYPTHASH hash) {
+    BYTE digest[32];
+    DWORD digestSize = sizeof(digest);
+    if (!CryptGetHashParam(hash, HP_HASHVAL, digest, &digestSize, 0)) {
+        return "";
+    }
+
+    return BytesToHex(digest, digestSize);
+}
+
+std::string CreateSha256HashFromFile(const std::string& path) {
+    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return "";
+    }
+
+    HCRYPTPROV provider = 0;
+    HCRYPTHASH hash = 0;
+    std::string digest;
+
+    if (!CryptAcquireContextA(&provider, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+        CloseHandle(hFile);
+        return "";
+    }
+
+    if (CryptCreateHash(provider, CALG_SHA_256, 0, 0, &hash)) {
+        BYTE buffer[8192];
+        DWORD bytesRead = 0;
+        BOOL readOk = FALSE;
+        do {
+            readOk = ReadFile(hFile, buffer, sizeof(buffer), &bytesRead, NULL);
+            if (!readOk) {
+                break;
+            }
+            if (bytesRead > 0 && !CryptHashData(hash, buffer, bytesRead, 0)) {
+                readOk = FALSE;
+                break;
+            }
+        } while (bytesRead > 0);
+
+        if (readOk) {
+            digest = FinalizeHash(hash);
+        }
+    }
+
+    if (hash != 0) {
+        CryptDestroyHash(hash);
+    }
+    if (provider != 0) {
+        CryptReleaseContext(provider, 0);
+    }
+
+    CloseHandle(hFile);
+    return digest;
+}
+
+bool GetFileSizeForPath(const std::string& path, unsigned long long* size) {
+    if (size == NULL) {
+        return false;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA attrs;
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &attrs)) {
+        return false;
+    }
+
+    ULARGE_INTEGER value;
+    value.LowPart = attrs.nFileSizeLow;
+    value.HighPart = attrs.nFileSizeHigh;
+    *size = value.QuadPart;
+    return true;
+}
+
+bool ParseUnsignedLongLong(const std::string& value, unsigned long long* result) {
+    if (result == NULL || value.empty()) {
+        return false;
+    }
+
+    char* end = NULL;
+    unsigned long long parsed = _strtoui64(value.c_str(), &end, 10);
+    if (end == value.c_str() || *end != '\0') {
+        return false;
+    }
+
+    *result = parsed;
+    return true;
 }
 }
 
@@ -138,34 +280,10 @@ bool MihomoManager::EnsureDirectoryExists(const std::string& path) {
 
 bool MihomoManager::ExtractResource(int resourceId, const char* resourceType,
                                    const std::string& outputPath) {
-    // Get module handle
-    HMODULE hModule = GetModuleHandle(NULL);
-
-    // Find resource
-    HRSRC hRes = FindResourceA(hModule, MAKEINTRESOURCEA(resourceId), resourceType);
-    if (hRes == NULL) {
+    const void* pData = NULL;
+    DWORD size = 0;
+    if (!LoadResourceData(resourceId, resourceType, &pData, &size)) {
         printf("ERROR: FindResource failed for ID %d, type %s\n", resourceId, resourceType);
-        return false;
-    }
-
-    // Load resource
-    HGLOBAL hLoaded = LoadResource(hModule, hRes);
-    if (hLoaded == NULL) {
-        printf("ERROR: LoadResource failed\n");
-        return false;
-    }
-
-    // Lock resource
-    void* pData = LockResource(hLoaded);
-    if (pData == NULL) {
-        printf("ERROR: LockResource failed\n");
-        return false;
-    }
-
-    // Get resource size
-    DWORD size = SizeofResource(hModule, hRes);
-    if (size == 0) {
-        printf("ERROR: SizeofResource returned 0\n");
         return false;
     }
 
@@ -193,54 +311,79 @@ bool MihomoManager::ExtractResource(int resourceId, const char* resourceType,
     return true;
 }
 
-std::string MihomoManager::GetEmbeddedMihomoVersion() {
-    HMODULE hModule = GetModuleHandle(NULL);
-    HRSRC hRes = FindResourceA(hModule, MAKEINTRESOURCEA(IDR_MIHOMO_VERSION), "MIHOMO");
-    if (hRes == NULL) {
-        return "";
+bool MihomoManager::LoadEmbeddedMihomoManifest() {
+    if (m_manifestLoaded) {
+        return !m_manifest.sha256.empty() && m_manifest.size > 0;
     }
 
-    HGLOBAL hLoaded = LoadResource(hModule, hRes);
-    if (hLoaded == NULL) {
-        return "";
+    const void* pData = NULL;
+    DWORD size = 0;
+    if (!LoadResourceData(IDR_MIHOMO_MANIFEST, "MIHOMO", &pData, &size)) {
+        return false;
     }
 
-    void* pData = LockResource(hLoaded);
-    DWORD size = SizeofResource(hModule, hRes);
+    MihomoManifest manifest;
+    std::istringstream stream(std::string((const char*)pData, size));
+    std::string line;
+    while (std::getline(stream, line)) {
+        line = Trim(line);
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
 
-    if (pData == NULL || size == 0) {
-        return "";
+        size_t sep = line.find('=');
+        if (sep == std::string::npos) {
+            continue;
+        }
+
+        std::string key = Trim(line.substr(0, sep));
+        std::string value = Trim(line.substr(sep + 1));
+        if (key == "version") {
+            manifest.version = value;
+        } else if (key == "size") {
+            if (!ParseUnsignedLongLong(value, &manifest.size)) {
+                return false;
+            }
+        } else if (key == "sha256") {
+            manifest.sha256 = ToLowerAscii(value);
+        }
     }
 
-    // Convert to string (trim whitespace/newlines)
-    std::string version((const char*)pData, size);
-    size_t end = version.find_last_not_of(" \t\r\n");
-    if (end != std::string::npos) {
-        version = version.substr(0, end + 1);
-    }
-
-    return version;
+    m_manifestLoaded = true;
+    m_manifest = manifest;
+    return !m_manifest.sha256.empty() && m_manifest.size > 0;
 }
 
-std::string MihomoManager::GetInstalledMihomoVersion() {
-    std::string versionFile = m_workDir + "\\.mihomo_version";
-
-    HANDLE hFile = CreateFileA(versionFile.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
+std::string MihomoManager::GetEmbeddedMihomoVersion() {
+    if (!LoadEmbeddedMihomoManifest()) {
         return "";
     }
 
-    char buffer[32];
-    DWORD bytesRead;
-    BOOL result = ReadFile(hFile, buffer, sizeof(buffer) - 1, &bytesRead, NULL);
-    CloseHandle(hFile);
+    return m_manifest.version;
+}
 
-    if (!result || bytesRead == 0) {
+std::string MihomoManager::GetEmbeddedMihomoHash() {
+    if (!LoadEmbeddedMihomoManifest()) {
         return "";
     }
 
-    buffer[bytesRead] = '\0';
-    return std::string(buffer);
+    return m_manifest.sha256;
+}
+
+unsigned long long MihomoManager::GetEmbeddedMihomoSize() {
+    if (!LoadEmbeddedMihomoManifest()) {
+        return 0;
+    }
+
+    return m_manifest.size;
+}
+
+std::string MihomoManager::GetInstalledMihomoHash() {
+    return ToLowerAscii(CreateSha256HashFromFile(m_exePath));
+}
+
+bool MihomoManager::GetInstalledMihomoSize(unsigned long long* size) {
+    return GetFileSizeForPath(m_exePath, size);
 }
 
 bool MihomoManager::IsTunEnabled() const {
@@ -382,27 +525,50 @@ bool MihomoManager::IsMihomoUpdateNeeded() {
         return true;
     }
 
-    // Get embedded version
-    std::string embeddedVersion = GetEmbeddedMihomoVersion();
-    if (embeddedVersion.empty()) {
-        printf("Warning: Failed to read embedded mihomo version\n");
+    unsigned long long embeddedSize = GetEmbeddedMihomoSize();
+    std::string embeddedHash = GetEmbeddedMihomoHash();
+    if (embeddedSize == 0 || embeddedHash.empty()) {
+        printf("Warning: Failed to read embedded mihomo manifest\n");
         return false;
     }
 
-    // Get installed version
-    std::string installedVersion = GetInstalledMihomoVersion();
-    if (installedVersion.empty()) {
-        printf("Mihomo not installed yet\n");
+    std::string embeddedVersion = GetEmbeddedMihomoVersion();
+
+    unsigned long long installedSize = 0;
+    if (!GetInstalledMihomoSize(&installedSize)) {
+        printf("Installed mihomo.exe is unreadable, refresh required\n");
         return true;
     }
 
-    // Compare versions
-    if (embeddedVersion == installedVersion) {
-        printf("Mihomo up to date: %s\n", embeddedVersion.c_str());
+    if (embeddedSize != installedSize) {
+        if (!embeddedVersion.empty()) {
+            printf("Mihomo size changed, updating to embedded version %s\n", embeddedVersion.c_str());
+        } else {
+            printf("Mihomo size differs from embedded manifest, update needed\n");
+        }
+        return true;
+    }
+
+    std::string installedHash = GetInstalledMihomoHash();
+    if (installedHash.empty()) {
+        printf("Installed mihomo.exe hash check failed, refresh required\n");
+        return true;
+    }
+
+    if (embeddedHash == installedHash) {
+        if (!embeddedVersion.empty()) {
+            printf("Mihomo up to date: %s\n", embeddedVersion.c_str());
+        } else {
+            printf("Mihomo binary matches embedded resource\n");
+        }
         return false;
     }
 
-    printf("Mihomo update available: %s -> %s\n", installedVersion.c_str(), embeddedVersion.c_str());
+    if (!embeddedVersion.empty()) {
+        printf("Mihomo hash changed, updating to embedded version %s\n", embeddedVersion.c_str());
+    } else {
+        printf("Mihomo hash differs from embedded manifest, update needed\n");
+    }
     return true;
 }
 
@@ -417,21 +583,28 @@ bool MihomoManager::ExtractMihomoExe() {
     StopManagedMihomoProcesses();
 
     printf("Extracting mihomo.exe...\n");
-    if (!ExtractResource(IDR_MIHOMO_EXE, "MIHOMO", m_exePath)) {
+    std::string tempPath = m_exePath + ".new";
+    if (!ExtractResource(IDR_MIHOMO_EXE, "MIHOMO", tempPath)) {
         return false;
     }
 
-    // Write version file
-    std::string embeddedVersion = GetEmbeddedMihomoVersion();
-    if (!embeddedVersion.empty()) {
-        std::string versionFile = m_workDir + "\\.mihomo_version";
-        HANDLE hFile = CreateFileA(versionFile.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hFile != INVALID_HANDLE_VALUE) {
-            DWORD written;
-            WriteFile(hFile, embeddedVersion.c_str(), embeddedVersion.length(), &written, NULL);
-            CloseHandle(hFile);
-            printf("Version saved: %s\n", embeddedVersion.c_str());
-        }
+    unsigned long long embeddedSize = GetEmbeddedMihomoSize();
+    std::string embeddedHash = GetEmbeddedMihomoHash();
+    unsigned long long extractedSize = 0;
+    std::string extractedHash = CreateSha256HashFromFile(tempPath);
+    if (embeddedSize == 0 || embeddedHash.empty() ||
+        !GetFileSizeForPath(tempPath, &extractedSize) || extractedSize != embeddedSize ||
+        extractedHash.empty() || ToLowerAscii(extractedHash) != embeddedHash) {
+        printf("ERROR: Extracted mihomo.exe hash verification failed\n");
+        DeleteFileA(tempPath.c_str());
+        return false;
+    }
+
+    if (!MoveFileExA(tempPath.c_str(), m_exePath.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        printf("ERROR: Failed to replace mihomo.exe (error: %lu)\n", GetLastError());
+        DeleteFileA(tempPath.c_str());
+        return false;
     }
 
     return true;

@@ -1,7 +1,7 @@
 # SysProxyBar - Windows系统代理控制工具
 # 编译要求：CMake 3.15+, TDM-GCC 10.3.0 或 Visual Studio 2019+
 cmake_minimum_required(VERSION 3.15)
-project(SysProxyBar VERSION 3.0 LANGUAGES CXX)
+project(SysProxyBar VERSION 3.1 LANGUAGES CXX)
 
 # C++17 标准
 set(CMAKE_CXX_STANDARD 17)
@@ -44,6 +44,7 @@ add_executable(${PROJECT_NAME} WIN32 ${SOURCES} ${HEADERS} ${RESOURCES})
 
 # ============== 链接库 ==============
 target_link_libraries(${PROJECT_NAME}
+    advapi32     # CryptoAPI (SHA-256)
     wininet      # Internet设置API
     shell32      # Shell功能（托盘图标等）
     gdi32        # GDI图形功能

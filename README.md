@@ -87,7 +87,7 @@ sys-proxy-bar/
 │   └── mihomo/
 │       ├── mihomo.exe        # Mihomo 可执行文件
 │       ├── config.yaml       # 默认配置文件
-│       └── mihomo.version    # 版本号标记
+│       └── mihomo.manifest   # 构建期生成的校验清单
 ├── dist/                     # WebUI 静态资源（Zashboard）
 │   ├── index.html
 │   └── assets/

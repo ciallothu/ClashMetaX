@@ -4,6 +4,7 @@ cmake-build-*/
 dist/
 release/
 archive/
+__pycache__/
 
 # Compiled files
 *.exe
