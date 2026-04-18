@@ -6,115 +6,118 @@
 
 #include <windows.h>
 #include <string>
-#include <shlobj.h>
+#include <vector>
 
-/**
- * MihomoManager - Manages mihomo.exe process lifecycle
- *
- * This class handles:
- * - Extracting mihomo.exe and config.yaml from embedded resources
- * - Starting and stopping the mihomo process
- * - Monitoring process health and auto-restart on crash
- * - Managing process lifecycle tied to application
- */
+struct KernelMetadata {
+    std::string id;
+    std::string version;
+    std::string source;
+    std::string path;
+    std::string installedAt;
+    std::string arch;
+    std::string assetName;
+    std::string sha256;
+};
+
+class KernelRegistry {
+public:
+    explicit KernelRegistry(const std::string& appDir);
+
+    bool Initialize();
+    std::vector<KernelMetadata> GetInstalledKernels() const;
+    KernelMetadata GetSelectedKernel() const;
+    std::string GetSelectedKernelId() const;
+    bool HasKernels() const;
+    bool AddOrUpdateKernel(const KernelMetadata& kernel);
+    bool SelectKernel(const std::string& kernelId);
+
+    const std::string& GetKernelsDir() const { return m_kernelsDir; }
+    const std::string& GetStateFilePath() const { return m_statePath; }
+
+private:
+    bool LoadState();
+    bool SaveState() const;
+    void ScanKernelDirectories();
+
+private:
+    std::string m_appDir;
+    std::string m_kernelsDir;
+    std::string m_stateDir;
+    std::string m_statePath;
+    std::string m_selectedKernelId;
+    std::vector<KernelMetadata> m_kernels;
+};
+
+class KernelDownloader {
+public:
+    KernelDownloader();
+    bool DownloadLatestStable(const std::string& kernelsDir, KernelMetadata* installedKernel, std::string* error);
+
+private:
+    bool QueryLatestStableRelease(std::string* tag, std::string* assetName, std::string* assetUrl, std::string* error);
+    bool DownloadFile(const std::string& url, const std::string& outputPath, std::string* error);
+    bool ExtractZip(const std::string& zipPath, const std::string& destination, std::string* error);
+    std::string NowIso8601Utc() const;
+};
+
+class KernelProcessManager {
+public:
+    KernelProcessManager();
+    ~KernelProcessManager();
+
+    bool Start(const std::string& kernelExePath, const std::string& workDir, const std::string& configPath);
+    void Stop();
+    bool Restart(const std::string& kernelExePath, const std::string& workDir, const std::string& configPath);
+    bool IsRunning() const;
+
+private:
+    static unsigned __stdcall MonitorThread(void* param);
+    void StartMonitor();
+    void StopMonitor();
+
+private:
+    PROCESS_INFORMATION m_processInfo;
+    HANDLE m_monitorThread;
+    bool m_shouldMonitor;
+    std::string m_lastKernelExe;
+    std::string m_lastWorkDir;
+    std::string m_lastConfig;
+};
+
 class MihomoManager {
 public:
     MihomoManager();
     ~MihomoManager();
 
-    // Initialize: Extract files and prepare for launch
     bool Initialize();
-
-    // Start mihomo process
     bool Start();
-
-    // Stop mihomo process
     void Stop();
-
-    // Restart mihomo process
     bool Restart();
-
-    // Check if process is running
     bool IsRunning() const;
 
-    // TUN mode helpers
     bool IsTunEnabled() const;
     bool SetTunEnabled(bool enable);
 
-    // Get paths
     std::string GetWorkingDirectory() const { return m_workDir; }
-    std::string GetExecutablePath() const { return m_exePath; }
     std::string GetConfigPath() const { return m_configPath; }
+    std::string GetKernelDirectory() const { return m_registry.GetKernelsDir(); }
+
+    std::vector<KernelMetadata> GetInstalledKernels() const;
+    KernelMetadata GetCurrentKernel() const;
+    bool SwitchKernel(const std::string& kernelId, std::string* error);
+    bool DownloadLatestKernel(std::string* error);
 
 private:
-    struct MihomoManifest {
-        std::string version;
-        unsigned long long size;
-        std::string sha256;
-
-        MihomoManifest() : size(0) {}
-    };
-
-    // Extract mihomo.exe from resources
-    bool ExtractMihomoExe();
-
-    // Check if mihomo update is needed
-    bool IsMihomoUpdateNeeded();
-
-    // Load embedded manifest metadata
-    bool LoadEmbeddedMihomoManifest();
-
-    // Get current mihomo version from manifest
-    std::string GetEmbeddedMihomoVersion();
-
-    // Get embedded mihomo.exe SHA-256 from manifest
-    std::string GetEmbeddedMihomoHash();
-
-    // Get embedded mihomo.exe size from manifest
-    unsigned long long GetEmbeddedMihomoSize();
-
-    // Get installed mihomo.exe SHA-256
-    std::string GetInstalledMihomoHash();
-
-    // Get installed mihomo.exe size
-    bool GetInstalledMihomoSize(unsigned long long* size);
-
-    // Extract default config.yaml from resources
-    bool ExtractDefaultConfig();
-
-    // Ensure target directory exists
     bool EnsureDirectoryExists(const std::string& path);
-
-    // Extract resource to file
-    bool ExtractResource(int resourceId, const char* resourceType,
-                        const std::string& outputPath);
-
-    // Monitoring thread function
-    static unsigned __stdcall MonitorThread(void* param);
-
-    // Start monitoring thread
-    void StartMonitor();
-
-    // Stop monitoring thread
-    void StopMonitor();
-
-    // Check if file exists
+    bool EnsureDefaultConfig();
     bool FileExists(const std::string& path) const;
-
-    // Stop any stale mihomo.exe process using the managed work directory
-    bool StopManagedMihomoProcesses();
-
-    // Update tun.enable in the runtime config file
     bool UpdateTunConfig(bool enable);
 
 private:
-    PROCESS_INFORMATION m_processInfo;
-    HANDLE m_monitorThread;
-    bool m_initialized;
-    bool m_shouldMonitor;
     std::string m_workDir;
-    std::string m_exePath;
     std::string m_configPath;
-    bool m_manifestLoaded;
-    MihomoManifest m_manifest;
+    KernelRegistry m_registry;
+    KernelDownloader m_downloader;
+    KernelProcessManager m_processManager;
+    bool m_initialized;
 };
