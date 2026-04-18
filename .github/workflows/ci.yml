@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Configure CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Collect binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Get-ChildItem -Path build -Recurse -Filter ClashMetaX.exe | Select-Object -First 1 | Copy-Item -Destination artifacts/ClashMetaX.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClashMetaX-windows
+          path: artifacts/ClashMetaX.exe

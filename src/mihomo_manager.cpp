@@ -1,865 +1,742 @@
 #include "mihomo_manager.h"
-#include "mihomo_resource.h"
-#include <stdio.h>
-#include <stdlib.h>
+
+#include <shlobj.h>
+#include <urlmon.h>
 #include <io.h>
 #include <process.h>
 #include <wincrypt.h>
 #include <fstream>
 #include <sstream>
-#include <vector>
-#include <tlhelp32.h>
+#include <algorithm>
+#include <cstdio>
+#include <ctime>
 
-#pragma comment(lib, "shell32.lib")
-
-MihomoManager::MihomoManager()
-    : m_monitorThread(NULL)
-    , m_initialized(false)
-    , m_shouldMonitor(false)
-    , m_manifestLoaded(false)
-{
-    ZeroMemory(&m_processInfo, sizeof(m_processInfo));
-
-    // Get AppData path
-    char appdataPath[MAX_PATH];
-    if (SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdataPath) == S_OK) {
-        m_workDir = std::string(appdataPath) + "\\SysProxyBar";
-        m_exePath = m_workDir + "\\mihomo.exe";
-        m_configPath = m_workDir + "\\config.yaml";
-    }
-}
-
-MihomoManager::~MihomoManager() {
-    Stop();
-}
-
-bool MihomoManager::FileExists(const std::string& path) const {
-    return (_access(path.c_str(), 0) == 0);
-}
+#pragma comment(lib, "urlmon.lib")
 
 namespace {
-std::string TrimLeft(const std::string& value) {
-    size_t start = value.find_first_not_of(" \t");
-    return (start == std::string::npos) ? "" : value.substr(start);
+bool FileExists(const std::string& path) {
+    return _access(path.c_str(), 0) == 0;
 }
 
-std::string Trim(const std::string& value) {
-    size_t start = value.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) {
-        return "";
+bool EnsureDirectoryExists(const std::string& path) {
+    if (path.empty()) {
+        return false;
     }
-    size_t end = value.find_last_not_of(" \t\r\n");
-    return value.substr(start, end - start + 1);
-}
+    DWORD attributes = GetFileAttributesA(path.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        return true;
+    }
 
-std::string ToLowerAscii(const std::string& value) {
-    std::string lowered = value;
-    for (size_t i = 0; i < lowered.size(); ++i) {
-        if (lowered[i] >= 'A' && lowered[i] <= 'Z') {
-            lowered[i] = static_cast<char>(lowered[i] - 'A' + 'a');
+    size_t pos = path.find_last_of("\\/");
+    if (pos != std::string::npos) {
+        std::string parent = path.substr(0, pos);
+        if (!parent.empty() && !EnsureDirectoryExists(parent)) {
+            return false;
         }
     }
-    return lowered;
+
+    return CreateDirectoryA(path.c_str(), NULL) || GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
-size_t IndentWidth(const std::string& value) {
-    size_t indent = 0;
-    while (indent < value.size() && (value[indent] == ' ' || value[indent] == '\t')) {
-        indent++;
+std::string EscapeJson(const std::string& value) {
+    std::string out;
+    for (size_t i = 0; i < value.size(); ++i) {
+        const char c = value[i];
+        if (c == '\\' || c == '"') {
+            out.push_back('\\');
+            out.push_back(c);
+        } else if (c == '\n') {
+            out += "\\n";
+        } else {
+            out.push_back(c);
+        }
     }
-    return indent;
+    return out;
 }
 
-bool LoadResourceData(int resourceId, const char* resourceType, const void** data, DWORD* size) {
-    if (data == NULL || size == NULL) {
+std::string UnescapeJson(const std::string& value) {
+    std::string out;
+    bool escaped = false;
+    for (size_t i = 0; i < value.size(); ++i) {
+        char c = value[i];
+        if (escaped) {
+            if (c == 'n') {
+                out.push_back('\n');
+            } else {
+                out.push_back(c);
+            }
+            escaped = false;
+        } else if (c == '\\') {
+            escaped = true;
+        } else {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+std::string JsonValue(const std::string& blob, const std::string& key) {
+    std::string marker = "\"" + key + "\"";
+    size_t k = blob.find(marker);
+    if (k == std::string::npos) {
+        return "";
+    }
+    size_t colon = blob.find(':', k + marker.size());
+    size_t quote1 = blob.find('"', colon + 1);
+    size_t quote2 = blob.find('"', quote1 + 1);
+    if (colon == std::string::npos || quote1 == std::string::npos || quote2 == std::string::npos) {
+        return "";
+    }
+    return UnescapeJson(blob.substr(quote1 + 1, quote2 - quote1 - 1));
+}
+
+std::string MakeKernelId(const std::string& version, const std::string& arch) {
+    return version + "-" + arch;
+}
+
+std::string NormalizePathForJson(const std::string& path) {
+    std::string normalized = path;
+    for (size_t i = 0; i < normalized.size(); ++i) {
+        if (normalized[i] == '\\') {
+            normalized[i] = '/';
+        }
+    }
+    return normalized;
+}
+
+std::string QuoteForPowershell(const std::string& path) {
+    std::string escaped;
+    for (size_t i = 0; i < path.size(); ++i) {
+        if (path[i] == '\'') {
+            escaped += "''";
+        } else {
+            escaped.push_back(path[i]);
+        }
+    }
+    return "'" + escaped + "'";
+}
+
+bool CopyFileAtomic(const std::string& from, const std::string& to) {
+    std::string tmp = to + ".tmp";
+    if (!CopyFileA(from.c_str(), tmp.c_str(), FALSE)) {
         return false;
     }
-
-    HMODULE hModule = GetModuleHandle(NULL);
-    HRSRC hRes = FindResourceA(hModule, MAKEINTRESOURCEA(resourceId), resourceType);
-    if (hRes == NULL) {
+    if (!MoveFileExA(tmp.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(tmp.c_str());
         return false;
     }
-
-    HGLOBAL hLoaded = LoadResource(hModule, hRes);
-    if (hLoaded == NULL) {
-        return false;
-    }
-
-    void* pData = LockResource(hLoaded);
-    DWORD resourceSize = SizeofResource(hModule, hRes);
-    if (pData == NULL || resourceSize == 0) {
-        return false;
-    }
-
-    *data = pData;
-    *size = resourceSize;
     return true;
 }
 
-std::string BytesToHex(const BYTE* data, DWORD size) {
-    static const char kHexChars[] = "0123456789abcdef";
-    std::string hex;
-    hex.resize(size * 2);
-
-    for (DWORD i = 0; i < size; ++i) {
-        hex[i * 2] = kHexChars[(data[i] >> 4) & 0x0F];
-        hex[i * 2 + 1] = kHexChars[data[i] & 0x0F];
-    }
-
-    return hex;
-}
-
-std::string FinalizeHash(HCRYPTHASH hash) {
-    BYTE digest[32];
-    DWORD digestSize = sizeof(digest);
-    if (!CryptGetHashParam(hash, HP_HASHVAL, digest, &digestSize, 0)) {
-        return "";
-    }
-
-    return BytesToHex(digest, digestSize);
-}
-
-std::string CreateSha256HashFromFile(const std::string& path) {
-    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
-                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+std::string ComputeSha256(const std::string& filePath) {
+    HANDLE hFile = CreateFileA(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) {
         return "";
     }
 
     HCRYPTPROV provider = 0;
     HCRYPTHASH hash = 0;
-    std::string digest;
-
-    if (!CryptAcquireContextA(&provider, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-        CloseHandle(hFile);
-        return "";
-    }
-
-    if (CryptCreateHash(provider, CALG_SHA_256, 0, 0, &hash)) {
+    std::string result;
+    if (CryptAcquireContextA(&provider, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT) &&
+        CryptCreateHash(provider, CALG_SHA_256, 0, 0, &hash)) {
         BYTE buffer[8192];
-        DWORD bytesRead = 0;
-        BOOL readOk = FALSE;
-        do {
-            readOk = ReadFile(hFile, buffer, sizeof(buffer), &bytesRead, NULL);
-            if (!readOk) {
+        DWORD read = 0;
+        bool ok = true;
+        while (ReadFile(hFile, buffer, sizeof(buffer), &read, NULL) && read > 0) {
+            if (!CryptHashData(hash, buffer, read, 0)) {
+                ok = false;
                 break;
             }
-            if (bytesRead > 0 && !CryptHashData(hash, buffer, bytesRead, 0)) {
-                readOk = FALSE;
-                break;
-            }
-        } while (bytesRead > 0);
-
-        if (readOk) {
-            digest = FinalizeHash(hash);
         }
-    }
-
-    if (hash != 0) {
-        CryptDestroyHash(hash);
-    }
-    if (provider != 0) {
-        CryptReleaseContext(provider, 0);
-    }
-
-    CloseHandle(hFile);
-    return digest;
-}
-
-bool GetFileSizeForPath(const std::string& path, unsigned long long* size) {
-    if (size == NULL) {
-        return false;
-    }
-
-    WIN32_FILE_ATTRIBUTE_DATA attrs;
-    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &attrs)) {
-        return false;
-    }
-
-    ULARGE_INTEGER value;
-    value.LowPart = attrs.nFileSizeLow;
-    value.HighPart = attrs.nFileSizeHigh;
-    *size = value.QuadPart;
-    return true;
-}
-
-bool ParseUnsignedLongLong(const std::string& value, unsigned long long* result) {
-    if (result == NULL || value.empty()) {
-        return false;
-    }
-
-    char* end = NULL;
-    unsigned long long parsed = _strtoui64(value.c_str(), &end, 10);
-    if (end == value.c_str() || *end != '\0') {
-        return false;
-    }
-
-    *result = parsed;
-    return true;
-}
-}
-
-bool MihomoManager::StopManagedMihomoProcesses() {
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        printf("WARNING: Failed to enumerate processes (error: %lu)\n", GetLastError());
-        return false;
-    }
-
-    bool stoppedAny = false;
-    int widePathLength = MultiByteToWideChar(CP_ACP, 0, m_exePath.c_str(), -1, NULL, 0);
-    std::wstring managedExePath;
-    if (widePathLength > 0) {
-        managedExePath.resize(widePathLength);
-        MultiByteToWideChar(CP_ACP, 0, m_exePath.c_str(), -1, &managedExePath[0], widePathLength);
-        if (!managedExePath.empty() && managedExePath.back() == L'\0') {
-            managedExePath.pop_back();
-        }
-    }
-
-    PROCESSENTRY32 pe;
-    pe.dwSize = sizeof(pe);
-
-    if (Process32First(snapshot, &pe)) {
-        do {
-            if (_wcsicmp(pe.szExeFile, L"mihomo.exe") != 0) {
-                continue;
-            }
-
-            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
-            if (process == NULL) {
-                continue;
-            }
-
-            wchar_t processPath[MAX_PATH];
-            DWORD processPathSize = MAX_PATH;
-            bool shouldStop = false;
-            if (!managedExePath.empty() && QueryFullProcessImageNameW(process, 0, processPath, &processPathSize)) {
-                shouldStop = (_wcsicmp(processPath, managedExePath.c_str()) == 0);
-            }
-
-            if (shouldStop) {
-                printf("Stopping stale mihomo process (PID: %lu)\n", pe.th32ProcessID);
-                if (TerminateProcess(process, 0)) {
-                    WaitForSingleObject(process, 5000);
-                    stoppedAny = true;
-                } else {
-                    printf("WARNING: Failed to terminate stale mihomo process (error: %lu)\n", GetLastError());
+        if (ok) {
+            BYTE digest[32];
+            DWORD digestSize = sizeof(digest);
+            if (CryptGetHashParam(hash, HP_HASHVAL, digest, &digestSize, 0)) {
+                static const char* kHex = "0123456789abcdef";
+                result.reserve(digestSize * 2);
+                for (DWORD i = 0; i < digestSize; ++i) {
+                    result.push_back(kHex[(digest[i] >> 4) & 0x0F]);
+                    result.push_back(kHex[digest[i] & 0x0F]);
                 }
             }
-
-            CloseHandle(process);
-        } while (Process32Next(snapshot, &pe));
+        }
     }
 
-    CloseHandle(snapshot);
-    return stoppedAny;
-}
-
-bool MihomoManager::EnsureDirectoryExists(const std::string& path) {
-    if (path.empty()) {
-        return false;
-    }
-
-    // Check if directory already exists
-    DWORD attrib = GetFileAttributesA(path.c_str());
-    if (attrib != INVALID_FILE_ATTRIBUTES &&
-        (attrib & FILE_ATTRIBUTE_DIRECTORY)) {
-        return true;
-    }
-
-    // Create directory (recursive)
-    if (CreateDirectoryA(path.c_str(), NULL) ||
-        GetLastError() == ERROR_ALREADY_EXISTS) {
-        return true;
-    }
-
-    return false;
-}
-
-bool MihomoManager::ExtractResource(int resourceId, const char* resourceType,
-                                   const std::string& outputPath) {
-    const void* pData = NULL;
-    DWORD size = 0;
-    if (!LoadResourceData(resourceId, resourceType, &pData, &size)) {
-        printf("ERROR: FindResource failed for ID %d, type %s\n", resourceId, resourceType);
-        return false;
-    }
-
-    // Create file
-    HANDLE hFile = CreateFileA(outputPath.c_str(), GENERIC_WRITE, 0, NULL,
-                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        printf("ERROR: CreateFile failed for %s (error: %lu)\n",
-               outputPath.c_str(), GetLastError());
-        return false;
-    }
-
-    // Write resource data to file
-    DWORD written;
-    BOOL result = WriteFile(hFile, pData, size, &written, NULL);
+    if (hash) CryptDestroyHash(hash);
+    if (provider) CryptReleaseContext(provider, 0);
     CloseHandle(hFile);
+    return result;
+}
+}
 
-    if (!result || written != size) {
-        printf("ERROR: WriteFile failed (written: %lu, expected: %lu)\n",
-               written, size);
+KernelRegistry::KernelRegistry(const std::string& appDir)
+    : m_appDir(appDir)
+    , m_kernelsDir(appDir + "\\kernels")
+    , m_stateDir(appDir + "\\state")
+    , m_statePath(appDir + "\\state\\kernel-state.json") {}
+
+bool KernelRegistry::Initialize() {
+    if (!EnsureDirectoryExists(m_kernelsDir) || !EnsureDirectoryExists(m_stateDir)) {
         return false;
     }
 
-    printf("Extracted: %s (%lu bytes)\n", outputPath.c_str(), size);
+    ScanKernelDirectories();
+    if (!LoadState()) {
+        return SaveState();
+    }
     return true;
 }
 
-bool MihomoManager::LoadEmbeddedMihomoManifest() {
-    if (m_manifestLoaded) {
-        return !m_manifest.sha256.empty() && m_manifest.size > 0;
-    }
+std::vector<KernelMetadata> KernelRegistry::GetInstalledKernels() const { return m_kernels; }
 
-    const void* pData = NULL;
-    DWORD size = 0;
-    if (!LoadResourceData(IDR_MIHOMO_MANIFEST, "MIHOMO", &pData, &size)) {
+KernelMetadata KernelRegistry::GetSelectedKernel() const {
+    for (size_t i = 0; i < m_kernels.size(); ++i) {
+        if (m_kernels[i].id == m_selectedKernelId) {
+            return m_kernels[i];
+        }
+    }
+    return m_kernels.empty() ? KernelMetadata() : m_kernels[0];
+}
+
+std::string KernelRegistry::GetSelectedKernelId() const { return m_selectedKernelId; }
+bool KernelRegistry::HasKernels() const { return !m_kernels.empty(); }
+
+bool KernelRegistry::AddOrUpdateKernel(const KernelMetadata& kernel) {
+    if (!FileExists(kernel.path)) {
         return false;
     }
-
-    MihomoManifest manifest;
-    std::istringstream stream(std::string((const char*)pData, size));
-    std::string line;
-    while (std::getline(stream, line)) {
-        line = Trim(line);
-        if (line.empty() || line[0] == '#') {
-            continue;
-        }
-
-        size_t sep = line.find('=');
-        if (sep == std::string::npos) {
-            continue;
-        }
-
-        std::string key = Trim(line.substr(0, sep));
-        std::string value = Trim(line.substr(sep + 1));
-        if (key == "version") {
-            manifest.version = value;
-        } else if (key == "size") {
-            if (!ParseUnsignedLongLong(value, &manifest.size)) {
-                return false;
-            }
-        } else if (key == "sha256") {
-            manifest.sha256 = ToLowerAscii(value);
+    for (size_t i = 0; i < m_kernels.size(); ++i) {
+        if (m_kernels[i].id == kernel.id) {
+            m_kernels[i] = kernel;
+            return SaveState();
         }
     }
-
-    m_manifestLoaded = true;
-    m_manifest = manifest;
-    return !m_manifest.sha256.empty() && m_manifest.size > 0;
-}
-
-std::string MihomoManager::GetEmbeddedMihomoVersion() {
-    if (!LoadEmbeddedMihomoManifest()) {
-        return "";
+    m_kernels.push_back(kernel);
+    if (m_selectedKernelId.empty()) {
+        m_selectedKernelId = kernel.id;
     }
-
-    return m_manifest.version;
+    return SaveState();
 }
 
-std::string MihomoManager::GetEmbeddedMihomoHash() {
-    if (!LoadEmbeddedMihomoManifest()) {
-        return "";
-    }
-
-    return m_manifest.sha256;
-}
-
-unsigned long long MihomoManager::GetEmbeddedMihomoSize() {
-    if (!LoadEmbeddedMihomoManifest()) {
-        return 0;
-    }
-
-    return m_manifest.size;
-}
-
-std::string MihomoManager::GetInstalledMihomoHash() {
-    return ToLowerAscii(CreateSha256HashFromFile(m_exePath));
-}
-
-bool MihomoManager::GetInstalledMihomoSize(unsigned long long* size) {
-    return GetFileSizeForPath(m_exePath, size);
-}
-
-bool MihomoManager::IsTunEnabled() const {
-    std::ifstream configFile(m_configPath.c_str(), std::ios::in);
-    if (!configFile.is_open()) {
-        return false;
-    }
-
-    std::string line;
-    bool inTunSection = false;
-    size_t tunIndent = 0;
-
-    while (std::getline(configFile, line)) {
-        std::string trimmed = TrimLeft(line);
-        size_t indent = IndentWidth(line);
-
-        if (!inTunSection) {
-            if (trimmed == "tun:") {
-                inTunSection = true;
-                tunIndent = indent;
-            }
-            continue;
-        }
-
-        if (!trimmed.empty() && trimmed[0] != '#' && indent <= tunIndent) {
-            break;
-        }
-
-        if (indent > tunIndent && trimmed.rfind("enable:", 0) == 0) {
-            std::string value = Trim(trimmed.substr(7));
-            return value == "true";
+bool KernelRegistry::SelectKernel(const std::string& kernelId) {
+    for (size_t i = 0; i < m_kernels.size(); ++i) {
+        if (m_kernels[i].id == kernelId && FileExists(m_kernels[i].path)) {
+            m_selectedKernelId = kernelId;
+            return SaveState();
         }
     }
-
     return false;
 }
 
-bool MihomoManager::UpdateTunConfig(bool enable) {
-    std::ifstream configFile(m_configPath.c_str(), std::ios::in);
-    if (!configFile.is_open()) {
-        printf("ERROR: Failed to open config file: %s\n", m_configPath.c_str());
+bool KernelRegistry::LoadState() {
+    std::ifstream in(m_statePath.c_str(), std::ios::in | std::ios::binary);
+    if (!in.is_open()) {
         return false;
     }
-
-    std::vector<std::string> lines;
-    std::string line;
-    while (std::getline(configFile, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        lines.push_back(line);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const std::string content = ss.str();
+    m_selectedKernelId = JsonValue(content, "selected_kernel_id");
+    if (m_selectedKernelId.empty() && !m_kernels.empty()) {
+        m_selectedKernelId = m_kernels[0].id;
     }
-    configFile.close();
-
-    bool inTunSection = false;
-    bool updated = false;
-    size_t tunIndent = 0;
-
-    for (size_t i = 0; i < lines.size(); ++i) {
-        const std::string& currentLine = lines[i];
-        std::string trimmed = TrimLeft(currentLine);
-        size_t indent = IndentWidth(currentLine);
-
-        if (!inTunSection) {
-            if (trimmed == "tun:") {
-                inTunSection = true;
-                tunIndent = indent;
-            }
-            continue;
-        }
-
-        if (!trimmed.empty() && trimmed[0] != '#' && indent <= tunIndent) {
-            break;
-        }
-
-        if (indent > tunIndent && trimmed.rfind("enable:", 0) == 0) {
-            lines[i] = std::string(indent, ' ') + "enable: " + (enable ? "true" : "false");
-            updated = true;
-            break;
-        }
-    }
-
-    if (!updated) {
-        if (!lines.empty() && !lines.back().empty()) {
-            lines.push_back("");
-        }
-        lines.push_back("tun:");
-        lines.push_back(std::string(2, ' ') + "enable: " + (enable ? "true" : "false"));
-        lines.push_back("  stack: mixed");
-        lines.push_back("  dns-hijack:");
-        lines.push_back("    - 'any:53'");
-        lines.push_back("    - 'tcp://any:53'");
-        lines.push_back("  auto-route: true");
-        lines.push_back("  auto-detect-interface: true");
-        lines.push_back("  strict-route: true");
-    }
-
-    std::ofstream outputFile(m_configPath.c_str(), std::ios::out | std::ios::trunc);
-    if (!outputFile.is_open()) {
-        printf("ERROR: Failed to write config file: %s\n", m_configPath.c_str());
-        return false;
-    }
-
-    for (size_t i = 0; i < lines.size(); ++i) {
-        outputFile << lines[i] << "\n";
-    }
-
-    return outputFile.good();
+    return true;
 }
 
-bool MihomoManager::SetTunEnabled(bool enable) {
-    if (!FileExists(m_configPath)) {
-        if (!ExtractDefaultConfig()) {
+bool KernelRegistry::SaveState() const {
+    if (!EnsureDirectoryExists(m_stateDir)) {
+        return false;
+    }
+
+    std::ofstream out(m_statePath.c_str(), std::ios::out | std::ios::trunc | std::ios::binary);
+    if (!out.is_open()) {
+        return false;
+    }
+
+    KernelMetadata selected;
+    for (size_t i = 0; i < m_kernels.size(); ++i) {
+        if (m_kernels[i].id == m_selectedKernelId) {
+            selected = m_kernels[i];
+            break;
+        }
+    }
+
+    out << "{\n";
+    out << "  \"selected_kernel_id\": \"" << EscapeJson(m_selectedKernelId) << "\",\n";
+    out << "  \"selected_version\": \"" << EscapeJson(selected.version) << "\",\n";
+    out << "  \"installed_kernels\": [\n";
+    for (size_t i = 0; i < m_kernels.size(); ++i) {
+        const KernelMetadata& k = m_kernels[i];
+        out << "    {\n";
+        out << "      \"id\": \"" << EscapeJson(k.id) << "\",\n";
+        out << "      \"version\": \"" << EscapeJson(k.version) << "\",\n";
+        out << "      \"source\": \"" << EscapeJson(k.source) << "\",\n";
+        out << "      \"path\": \"" << EscapeJson(NormalizePathForJson(k.path)) << "\",\n";
+        out << "      \"installed_at\": \"" << EscapeJson(k.installedAt) << "\",\n";
+        out << "      \"arch\": \"" << EscapeJson(k.arch) << "\",\n";
+        out << "      \"asset_name\": \"" << EscapeJson(k.assetName) << "\",\n";
+        out << "      \"sha256\": \"" << EscapeJson(k.sha256) << "\"\n";
+        out << "    }" << (i + 1 < m_kernels.size() ? "," : "") << "\n";
+    }
+    out << "  ]\n";
+    out << "}\n";
+    return true;
+}
+
+void KernelRegistry::ScanKernelDirectories() {
+    m_kernels.clear();
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((m_kernelsDir + "\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+        std::string kernelDir = m_kernelsDir + "\\" + fd.cFileName;
+        std::string exePath = kernelDir + "\\mihomo.exe";
+        if (!FileExists(exePath)) continue;
+
+        KernelMetadata km;
+        km.id = fd.cFileName;
+        km.version = fd.cFileName;
+        km.source = "downloaded";
+        km.path = exePath;
+        km.installedAt = "";
+        km.arch = "windows-amd64";
+        km.assetName = "";
+        km.sha256 = ComputeSha256(exePath);
+        m_kernels.push_back(km);
+    } while (FindNextFileA(h, &fd));
+
+    FindClose(h);
+}
+
+KernelDownloader::KernelDownloader() {}
+
+bool KernelDownloader::DownloadFile(const std::string& url, const std::string& outputPath, std::string* error) {
+    HRESULT hr = URLDownloadToFileA(NULL, url.c_str(), outputPath.c_str(), 0, NULL);
+    if (FAILED(hr)) {
+        if (error) *error = "下载失败，请检查网络或 GitHub 访问。";
+        return false;
+    }
+    return true;
+}
+
+bool KernelDownloader::ExtractZip(const std::string& zipPath, const std::string& destination, std::string* error) {
+    if (!EnsureDirectoryExists(destination)) {
+        if (error) *error = "创建解压目录失败。";
+        return false;
+    }
+    std::string command = "powershell -NoProfile -ExecutionPolicy Bypass -Command \"Expand-Archive -Path " +
+        QuoteForPowershell(zipPath) + " -DestinationPath " + QuoteForPowershell(destination) + " -Force\"";
+    int rc = system(command.c_str());
+    if (rc != 0) {
+        if (error) *error = "解压内核压缩包失败。";
+        return false;
+    }
+    return true;
+}
+
+bool KernelDownloader::QueryLatestStableRelease(std::string* tag, std::string* assetName, std::string* assetUrl, std::string* error) {
+    const std::string tempFile = "mihomo_release_latest.json";
+    if (!DownloadFile("https://api.github.com/repos/MetaCubeX/mihomo/releases/latest", tempFile, error)) {
+        return false;
+    }
+
+    std::ifstream in(tempFile.c_str(), std::ios::in | std::ios::binary);
+    if (!in.is_open()) {
+        if (error) *error = "读取版本信息失败。";
+        DeleteFileA(tempFile.c_str());
+        return false;
+    }
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const std::string body = ss.str();
+    DeleteFileA(tempFile.c_str());
+
+    *tag = JsonValue(body, "tag_name");
+    if (tag->empty()) {
+        if (error) *error = "解析最新版本号失败。";
+        return false;
+    }
+
+    size_t pos = 0;
+    const std::string nameMarker = "\"name\"";
+    const std::string urlMarker = "\"browser_download_url\"";
+    while ((pos = body.find(nameMarker, pos)) != std::string::npos) {
+        size_t nq1 = body.find('"', body.find(':', pos) + 1);
+        size_t nq2 = body.find('"', nq1 + 1);
+        std::string name = body.substr(nq1 + 1, nq2 - nq1 - 1);
+        if (name.find("windows") != std::string::npos && name.find("amd64") != std::string::npos && name.find(".zip") != std::string::npos) {
+            size_t upos = body.find(urlMarker, nq2);
+            size_t uq1 = body.find('"', body.find(':', upos) + 1);
+            size_t uq2 = body.find('"', uq1 + 1);
+            *assetName = name;
+            *assetUrl = body.substr(uq1 + 1, uq2 - uq1 - 1);
+            return true;
+        }
+        pos = nq2;
+    }
+
+    if (error) *error = "未找到适配 Windows amd64 的内核资产。";
+    return false;
+}
+
+std::string KernelDownloader::NowIso8601Utc() const {
+    time_t now = time(NULL);
+    struct tm t;
+#if defined(_WIN32)
+    gmtime_s(&t, &now);
+#else
+    gmtime_r(&now, &t);
+#endif
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &t);
+    return buf;
+}
+
+bool KernelDownloader::DownloadLatestStable(const std::string& kernelsDir, KernelMetadata* installedKernel, std::string* error) {
+    std::string tag, assetName, assetUrl;
+    if (!QueryLatestStableRelease(&tag, &assetName, &assetUrl, error)) {
+        return false;
+    }
+
+    const std::string kernelId = MakeKernelId(tag, "windows-amd64");
+    const std::string installDir = kernelsDir + "\\" + kernelId;
+    const std::string downloadZip = kernelsDir + "\\" + kernelId + ".zip";
+    const std::string tempExtractDir = kernelsDir + "\\" + kernelId + "-extract";
+
+    if (!DownloadFile(assetUrl, downloadZip, error)) {
+        return false;
+    }
+    if (!ExtractZip(downloadZip, tempExtractDir, error)) {
+        DeleteFileA(downloadZip.c_str());
+        return false;
+    }
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((tempExtractDir + "\\*.exe").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        if (error) *error = "解压后未找到 mihomo 可执行文件。";
+        DeleteFileA(downloadZip.c_str());
+        return false;
+    }
+
+    std::string sourceExe = tempExtractDir + "\\" + fd.cFileName;
+    FindClose(h);
+    EnsureDirectoryExists(installDir);
+    std::string targetExe = installDir + "\\mihomo.exe";
+    if (!CopyFileAtomic(sourceExe, targetExe)) {
+        if (error) *error = "安装内核失败，无法写入 mihomo.exe。";
+        return false;
+    }
+    DeleteFileA(downloadZip.c_str());
+
+    if (installedKernel) {
+        installedKernel->id = kernelId;
+        installedKernel->version = tag;
+        installedKernel->source = "downloaded";
+        installedKernel->path = targetExe;
+        installedKernel->installedAt = NowIso8601Utc();
+        installedKernel->arch = "windows-amd64";
+        installedKernel->assetName = assetName;
+        installedKernel->sha256 = ComputeSha256(targetExe);
+    }
+    return true;
+}
+
+KernelProcessManager::KernelProcessManager() : m_monitorThread(NULL), m_shouldMonitor(false) {
+    ZeroMemory(&m_processInfo, sizeof(m_processInfo));
+}
+
+KernelProcessManager::~KernelProcessManager() {
+    Stop();
+}
+
+bool KernelProcessManager::Start(const std::string& kernelExePath, const std::string& workDir, const std::string& configPath) {
+    if (IsRunning()) {
+        return true;
+    }
+
+    if (!FileExists(kernelExePath) || !FileExists(configPath)) {
+        return false;
+    }
+
+    std::string command = "\"" + kernelExePath + "\" -d \".\" -f \"" + configPath + "\"";
+    STARTUPINFOA si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+
+    ZeroMemory(&m_processInfo, sizeof(m_processInfo));
+
+    BOOL ok = CreateProcessA(NULL, &command[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, workDir.c_str(), &si, &m_processInfo);
+    if (!ok) {
+        return false;
+    }
+
+    m_lastKernelExe = kernelExePath;
+    m_lastWorkDir = workDir;
+    m_lastConfig = configPath;
+    StartMonitor();
+    return true;
+}
+
+void KernelProcessManager::Stop() {
+    StopMonitor();
+    if (m_processInfo.hProcess) {
+        TerminateProcess(m_processInfo.hProcess, 0);
+        WaitForSingleObject(m_processInfo.hProcess, 3000);
+        CloseHandle(m_processInfo.hProcess);
+        m_processInfo.hProcess = NULL;
+    }
+    if (m_processInfo.hThread) {
+        CloseHandle(m_processInfo.hThread);
+        m_processInfo.hThread = NULL;
+    }
+}
+
+bool KernelProcessManager::Restart(const std::string& kernelExePath, const std::string& workDir, const std::string& configPath) {
+    Stop();
+    return Start(kernelExePath, workDir, configPath);
+}
+
+bool KernelProcessManager::IsRunning() const {
+    if (!m_processInfo.hProcess) {
+        return false;
+    }
+    DWORD code = 0;
+    if (!GetExitCodeProcess(m_processInfo.hProcess, &code)) {
+        return false;
+    }
+    return code == STILL_ACTIVE;
+}
+
+void KernelProcessManager::StartMonitor() {
+    StopMonitor();
+    m_shouldMonitor = true;
+    unsigned tid = 0;
+    m_monitorThread = (HANDLE)_beginthreadex(NULL, 0, MonitorThread, this, 0, &tid);
+}
+
+void KernelProcessManager::StopMonitor() {
+    m_shouldMonitor = false;
+    if (m_monitorThread) {
+        WaitForSingleObject(m_monitorThread, 1000);
+        CloseHandle(m_monitorThread);
+        m_monitorThread = NULL;
+    }
+}
+
+unsigned __stdcall KernelProcessManager::MonitorThread(void* param) {
+    KernelProcessManager* manager = static_cast<KernelProcessManager*>(param);
+    while (manager->m_shouldMonitor) {
+        if (manager->m_processInfo.hProcess) {
+            DWORD wait = WaitForSingleObject(manager->m_processInfo.hProcess, 1000);
+            if (wait == WAIT_OBJECT_0 && manager->m_shouldMonitor) {
+                manager->Start(manager->m_lastKernelExe, manager->m_lastWorkDir, manager->m_lastConfig);
+            }
+        } else {
+            Sleep(500);
+        }
+    }
+    return 0;
+}
+
+MihomoManager::MihomoManager()
+    : m_registry("")
+    , m_initialized(false) {
+    char appdata[MAX_PATH] = {0};
+    if (SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata) == S_OK) {
+        m_workDir = std::string(appdata) + "\\ClashMetaX";
+    }
+    if (m_workDir.empty()) {
+        m_workDir = ".\\ClashMetaX";
+    }
+    m_configPath = m_workDir + "\\config.yaml";
+    m_registry = KernelRegistry(m_workDir);
+}
+
+MihomoManager::~MihomoManager() {
+    Stop();
+}
+
+bool MihomoManager::FileExists(const std::string& path) const { return ::FileExists(path); }
+bool MihomoManager::EnsureDirectoryExists(const std::string& path) { return ::EnsureDirectoryExists(path); }
+
+bool MihomoManager::EnsureDefaultConfig() {
+    if (FileExists(m_configPath)) {
+        return true;
+    }
+    std::ofstream out(m_configPath.c_str(), std::ios::out | std::ios::trunc);
+    if (!out.is_open()) {
+        return false;
+    }
+    out << "mixed-port: 7890\n"
+        << "allow-lan: false\n"
+        << "mode: rule\n"
+        << "log-level: info\n"
+        << "external-controller: 127.0.0.1:9090\n"
+        << "dns:\n"
+        << "  enable: true\n"
+        << "  nameserver:\n"
+        << "    - 223.5.5.5\n"
+        << "    - 119.29.29.29\n"
+        << "proxies: []\n"
+        << "proxy-groups:\n"
+        << "  - name: PROXY\n"
+        << "    type: select\n"
+        << "    proxies:\n"
+        << "      - DIRECT\n"
+        << "rules:\n"
+        << "  - MATCH,PROXY\n"
+        << "tun:\n"
+        << "  enable: false\n";
+    return true;
+}
+
+bool MihomoManager::Initialize() {
+    if (m_initialized) return true;
+    if (!EnsureDirectoryExists(m_workDir)) return false;
+    if (!EnsureDefaultConfig()) return false;
+    if (!m_registry.Initialize()) return false;
+
+    if (!m_registry.HasKernels()) {
+        std::string error;
+        if (!DownloadLatestKernel(&error)) {
+            printf("ERROR: %s\n", error.c_str());
             return false;
         }
     }
 
-    bool current = IsTunEnabled();
-    if (current == enable) {
-        return true;
-    }
-
-    if (!UpdateTunConfig(enable)) {
-        return false;
-    }
-
-    printf("TUN mode %s\n", enable ? "enabled" : "disabled");
-
-    if (IsRunning()) {
-        return Restart();
-    }
-
-    return Start();
-}
-
-bool MihomoManager::IsMihomoUpdateNeeded() {
-    // If mihomo.exe doesn't exist, need to extract
-    if (!FileExists(m_exePath)) {
-        return true;
-    }
-
-    unsigned long long embeddedSize = GetEmbeddedMihomoSize();
-    std::string embeddedHash = GetEmbeddedMihomoHash();
-    if (embeddedSize == 0 || embeddedHash.empty()) {
-        printf("Warning: Failed to read embedded mihomo manifest\n");
-        return false;
-    }
-
-    std::string embeddedVersion = GetEmbeddedMihomoVersion();
-
-    unsigned long long installedSize = 0;
-    if (!GetInstalledMihomoSize(&installedSize)) {
-        printf("Installed mihomo.exe is unreadable, refresh required\n");
-        return true;
-    }
-
-    if (embeddedSize != installedSize) {
-        if (!embeddedVersion.empty()) {
-            printf("Mihomo size changed, updating to embedded version %s\n", embeddedVersion.c_str());
-        } else {
-            printf("Mihomo size differs from embedded manifest, update needed\n");
-        }
-        return true;
-    }
-
-    std::string installedHash = GetInstalledMihomoHash();
-    if (installedHash.empty()) {
-        printf("Installed mihomo.exe hash check failed, refresh required\n");
-        return true;
-    }
-
-    if (embeddedHash == installedHash) {
-        if (!embeddedVersion.empty()) {
-            printf("Mihomo up to date: %s\n", embeddedVersion.c_str());
-        } else {
-            printf("Mihomo binary matches embedded resource\n");
-        }
-        return false;
-    }
-
-    if (!embeddedVersion.empty()) {
-        printf("Mihomo hash changed, updating to embedded version %s\n", embeddedVersion.c_str());
-    } else {
-        printf("Mihomo hash differs from embedded manifest, update needed\n");
-    }
-    return true;
-}
-
-bool MihomoManager::ExtractMihomoExe() {
-    // Check if update is needed
-    if (!IsMihomoUpdateNeeded()) {
-        return true;
-    }
-
-    // A stale mihomo.exe from an older build can keep the target file locked and
-    // block replacement during initialization.
-    StopManagedMihomoProcesses();
-
-    printf("Extracting mihomo.exe...\n");
-    std::string tempPath = m_exePath + ".new";
-    if (!ExtractResource(IDR_MIHOMO_EXE, "MIHOMO", tempPath)) {
-        return false;
-    }
-
-    unsigned long long embeddedSize = GetEmbeddedMihomoSize();
-    std::string embeddedHash = GetEmbeddedMihomoHash();
-    unsigned long long extractedSize = 0;
-    std::string extractedHash = CreateSha256HashFromFile(tempPath);
-    if (embeddedSize == 0 || embeddedHash.empty() ||
-        !GetFileSizeForPath(tempPath, &extractedSize) || extractedSize != embeddedSize ||
-        extractedHash.empty() || ToLowerAscii(extractedHash) != embeddedHash) {
-        printf("ERROR: Extracted mihomo.exe hash verification failed\n");
-        DeleteFileA(tempPath.c_str());
-        return false;
-    }
-
-    if (!MoveFileExA(tempPath.c_str(), m_exePath.c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        printf("ERROR: Failed to replace mihomo.exe (error: %lu)\n", GetLastError());
-        DeleteFileA(tempPath.c_str());
-        return false;
-    }
-
-    return true;
-}
-
-bool MihomoManager::ExtractDefaultConfig() {
-    // Check if already exists (don't overwrite user config)
-    if (FileExists(m_configPath)) {
-        printf("Config already exists: %s\n", m_configPath.c_str());
-        return true;
-    }
-
-    printf("Extracting config.yaml...\n");
-    return ExtractResource(IDR_MIHOMO_CONFIG, "MIHOMO", m_configPath);
-}
-
-bool MihomoManager::Initialize() {
-    if (m_initialized) {
-        return true;
-    }
-
-    printf("Initializing MihomoManager...\n");
-
-    // Ensure working directory exists
-    if (!EnsureDirectoryExists(m_workDir)) {
-        printf("ERROR: Failed to create directory: %s\n", m_workDir.c_str());
-        return false;
-    }
-
-    // Extract mihomo.exe
-    if (!ExtractMihomoExe()) {
-        printf("ERROR: Failed to extract mihomo.exe\n");
-        return false;
-    }
-
-    // Extract config.yaml
-    if (!ExtractDefaultConfig()) {
-        printf("ERROR: Failed to extract config.yaml\n");
-        return false;
-    }
-
     m_initialized = true;
-    printf("MihomoManager initialized successfully\n");
-    printf("  Work dir: %s\n", m_workDir.c_str());
-    printf("  Executable: %s\n", m_exePath.c_str());
-    printf("  Config: %s\n", m_configPath.c_str());
-
     return true;
 }
 
 bool MihomoManager::Start() {
-    if (IsRunning()) {
-        printf("Mihomo is already running\n");
-        return true;
-    }
-
-    if (!m_initialized && !Initialize()) {
-        printf("ERROR: Not initialized\n");
+    KernelMetadata selected = m_registry.GetSelectedKernel();
+    if (selected.path.empty()) {
         return false;
     }
-
-    printf("Starting mihomo...\n");
-
-    // Prepare startup info
-    STARTUPINFOA si;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;  // Hide window
-
-    ZeroMemory(&m_processInfo, sizeof(m_processInfo));
-
-    // Build command line: "mihomo.exe" -d "." -f "config.yaml"
-    // Use quotes to handle paths with spaces
-    std::string cmdLine = "\"" + m_exePath + "\" -d \"" +
-                         m_workDir + "\" -f \"" + m_configPath + "\"";
-
-    printf("Command line: %s\n", cmdLine.c_str());
-
-    // Create process
-    BOOL result = CreateProcessA(
-        NULL,                          // Application name
-        const_cast<char*>(cmdLine.c_str()), // Command line
-        NULL,                          // Process security attributes
-        NULL,                          // Thread security attributes
-        FALSE,                         // Do not inherit handles
-        CREATE_NO_WINDOW,              // Creation flags
-        NULL,                          // Environment
-        m_workDir.c_str(),             // Working directory
-        &si,                           // Startup info
-        &m_processInfo                 // Process information
-    );
-
-    if (!result) {
-        DWORD error = GetLastError();
-        printf("ERROR: CreateProcess failed (error: %lu)\n", error);
-        return false;
-    }
-
-    printf("Mihomo started successfully (PID: %lu)\n",
-           m_processInfo.dwProcessId);
-
-    // Start monitor thread only if not already monitoring
-    if (m_monitorThread == NULL) {
-        StartMonitor();
-    }
-
-    return true;
+    return m_processManager.Start(selected.path, m_workDir, m_configPath);
 }
 
 void MihomoManager::Stop() {
-    printf("Stopping mihomo...\n");
-
-    // Stop monitor thread first to prevent restart
-    StopMonitor();
-
-    // Terminate process if still running
-    if (m_processInfo.hProcess != NULL) {
-        // Check if process is still running before terminating
-        DWORD exitCode;
-        if (GetExitCodeProcess(m_processInfo.hProcess, &exitCode) && exitCode == STILL_ACTIVE) {
-            printf("Terminating mihomo process (PID: %lu)...\n", m_processInfo.dwProcessId);
-            if (!TerminateProcess(m_processInfo.hProcess, 0)) {
-                printf("WARNING: TerminateProcess failed (error: %lu)\n", GetLastError());
-            } else {
-                // Wait for process to terminate (max 2 seconds)
-                WaitForSingleObject(m_processInfo.hProcess, 2000);
-            }
-        }
-        CloseHandle(m_processInfo.hProcess);
-        m_processInfo.hProcess = NULL;
-    }
-
-    if (m_processInfo.hThread != NULL) {
-        CloseHandle(m_processInfo.hThread);
-        m_processInfo.hThread = NULL;
-    }
-
-    printf("Mihomo stopped\n");
+    m_processManager.Stop();
 }
 
 bool MihomoManager::Restart() {
-    printf("Restarting mihomo...\n");
-    Stop();
-    Sleep(500);  // Wait a bit for cleanup
-    return Start();
+    KernelMetadata selected = m_registry.GetSelectedKernel();
+    return m_processManager.Restart(selected.path, m_workDir, m_configPath);
 }
 
 bool MihomoManager::IsRunning() const {
-    if (m_processInfo.hProcess == NULL) {
+    return m_processManager.IsRunning();
+}
+
+std::vector<KernelMetadata> MihomoManager::GetInstalledKernels() const {
+    return m_registry.GetInstalledKernels();
+}
+
+KernelMetadata MihomoManager::GetCurrentKernel() const {
+    return m_registry.GetSelectedKernel();
+}
+
+bool MihomoManager::DownloadLatestKernel(std::string* error) {
+    KernelMetadata installed;
+    if (!m_downloader.DownloadLatestStable(m_registry.GetKernelsDir(), &installed, error)) {
+        return false;
+    }
+    if (!m_registry.AddOrUpdateKernel(installed)) {
+        if (error) *error = "写入内核状态失败。";
+        return false;
+    }
+    if (!m_registry.SelectKernel(installed.id)) {
+        if (error) *error = "设置当前内核失败。";
+        return false;
+    }
+    return true;
+}
+
+bool MihomoManager::SwitchKernel(const std::string& kernelId, std::string* error) {
+    KernelMetadata oldKernel = m_registry.GetSelectedKernel();
+    if (!m_registry.SelectKernel(kernelId)) {
+        if (error) *error = "目标内核不存在或不可执行。";
         return false;
     }
 
-    DWORD exitCode;
-    if (GetExitCodeProcess(m_processInfo.hProcess, &exitCode)) {
-        return (exitCode == STILL_ACTIVE);
+    KernelMetadata now = m_registry.GetSelectedKernel();
+    m_processManager.Stop();
+    if (!m_processManager.Start(now.path, m_workDir, m_configPath)) {
+        m_registry.SelectKernel(oldKernel.id);
+        if (!oldKernel.path.empty()) {
+            m_processManager.Start(oldKernel.path, m_workDir, m_configPath);
+        }
+        if (error) *error = "切换后新内核启动失败，已回滚。";
+        return false;
     }
+    return true;
+}
 
+bool MihomoManager::IsTunEnabled() const {
+    std::ifstream file(m_configPath.c_str());
+    if (!file.is_open()) return false;
+    std::string line;
+    bool inTun = false;
+    while (std::getline(file, line)) {
+        if (line.find("tun:") != std::string::npos) {
+            inTun = true;
+            continue;
+        }
+        if (inTun && line.find("enable:") != std::string::npos) {
+            return line.find("true") != std::string::npos;
+        }
+    }
     return false;
 }
 
-void MihomoManager::StartMonitor() {
-    if (m_monitorThread != NULL) {
-        return;  // Already monitoring
-    }
+bool MihomoManager::UpdateTunConfig(bool enable) {
+    std::ifstream in(m_configPath.c_str());
+    if (!in.is_open()) return false;
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(in, line)) lines.push_back(line);
+    in.close();
 
-    m_shouldMonitor = true;
-
-    // Create monitor thread
-    m_monitorThread = (HANDLE)_beginthreadex(
-        NULL, 0,
-        MonitorThread,
-        this,
-        0,
-        NULL
-    );
-
-    if (m_monitorThread == NULL) {
-        printf("WARNING: Failed to create monitor thread\n");
-    }
-}
-
-void MihomoManager::StopMonitor() {
-    if (m_monitorThread == NULL) {
-        return;
-    }
-
-    printf("Stopping monitor thread...\n");
-    m_shouldMonitor = false;
-
-    // Wait for thread to exit (max 5 seconds)
-    WaitForSingleObject(m_monitorThread, 5000);
-    CloseHandle(m_monitorThread);
-    m_monitorThread = NULL;
-}
-
-unsigned __stdcall MihomoManager::MonitorThread(void* param) {
-    MihomoManager* manager = static_cast<MihomoManager*>(param);
-
-    printf("Monitor thread started\n");
-
-    while (manager->m_shouldMonitor) {
-        // Wait for process exit, timeout 1 second
-        DWORD waitResult = WaitForSingleObject(
-            manager->m_processInfo.hProcess, 1000);
-
-        if (waitResult == WAIT_OBJECT_0) {
-            // Process has exited
-            DWORD exitCode;
-            GetExitCodeProcess(manager->m_processInfo.hProcess, &exitCode);
-
-            printf("Mihomo process exited (code: %lu)\n", exitCode);
-
-            if (exitCode != 0 && manager->m_shouldMonitor) {
-                // Abnormal exit, restart after delay
-                printf("Abnormal exit, restarting in 2 seconds...\n");
-                Sleep(2000);
-
-                if (manager->m_shouldMonitor) {
-                    // Close old handles
-                    CloseHandle(manager->m_processInfo.hProcess);
-                    CloseHandle(manager->m_processInfo.hThread);
-                    ZeroMemory(&manager->m_processInfo, sizeof(manager->m_processInfo));
-
-                    // Restart process without creating new monitor thread
-                    STARTUPINFOA si;
-                    ZeroMemory(&si, sizeof(si));
-                    si.cb = sizeof(si);
-                    si.dwFlags = STARTF_USESHOWWINDOW;
-                    si.wShowWindow = SW_HIDE;
-
-                    std::string cmdLine = "\"" + manager->m_exePath + "\" -d \"" +
-                                         manager->m_workDir + "\" -f \"" + manager->m_configPath + "\"";
-
-                    BOOL result = CreateProcessA(
-                        NULL, const_cast<char*>(cmdLine.c_str()),
-                        NULL, NULL, FALSE, CREATE_NO_WINDOW,
-                        NULL, manager->m_workDir.c_str(), &si, &manager->m_processInfo);
-
-                    if (result) {
-                        printf("Mihomo restarted successfully (PID: %lu)\n",
-                               manager->m_processInfo.dwProcessId);
-                    } else {
-                        printf("Failed to restart mihomo (error: %lu)\n", GetLastError());
-                        break;
-                    }
+    bool foundTun = false;
+    bool updated = false;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (lines[i].find("tun:") != std::string::npos) {
+            foundTun = true;
+            for (size_t j = i + 1; j < lines.size(); ++j) {
+                if (!lines[j].empty() && lines[j][0] != ' ' && lines[j][0] != '\t') break;
+                if (lines[j].find("enable:") != std::string::npos) {
+                    lines[j] = "  enable: " + std::string(enable ? "true" : "false");
+                    updated = true;
+                    break;
                 }
-            } else {
-                // Normal exit or monitor stopped
-                printf("Normal exit or monitor stopped, exiting monitor thread\n");
-                break;
             }
+            break;
         }
     }
 
-    printf("Monitor thread exiting\n");
-    return 0;
+    if (!foundTun) {
+        lines.push_back("tun:");
+        lines.push_back(std::string("  enable: ") + (enable ? "true" : "false"));
+        updated = true;
+    }
+
+    if (!updated) return false;
+
+    std::ofstream out(m_configPath.c_str(), std::ios::out | std::ios::trunc);
+    if (!out.is_open()) return false;
+    for (size_t i = 0; i < lines.size(); ++i) out << lines[i] << "\n";
+    return true;
+}
+
+bool MihomoManager::SetTunEnabled(bool enable) {
+    if (IsTunEnabled() == enable) return true;
+    if (!UpdateTunConfig(enable)) return false;
+    return Restart();
 }

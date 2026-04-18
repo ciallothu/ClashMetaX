@@ -1,0 +1,50 @@
+name: prerelease
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+
+jobs:
+  publish:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' }}
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Configure CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Pack artifacts
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path build -Recurse -Filter ClashMetaX.exe | Select-Object -First 1
+          if (-not $exe) { throw 'ClashMetaX.exe not found' }
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item $exe.FullName release/ClashMetaX.exe
+          Compress-Archive -Path release/ClashMetaX.exe -DestinationPath release/ClashMetaX.zip -Force
+      - name: Compute metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $shortSha = '${{ github.event.workflow_run.head_sha }}'.Substring(0,7)
+          $stamp = Get-Date -Format 'yyyyMMdd'
+          "tag=pre-$stamp-$shortSha" >> $env:GITHUB_OUTPUT
+          "name=ClashMetaX Pre-Release $stamp $shortSha" >> $env:GITHUB_OUTPUT
+      - name: Create or Update Pre-Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
+          prerelease: true
+          target_commitish: ${{ github.event.workflow_run.head_sha }}
+          files: |
+            release/ClashMetaX.exe
+            release/ClashMetaX.zip

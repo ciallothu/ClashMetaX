@@ -1,6 +1,11 @@
 #include "tray_icon.h"
 #include "resource.h"
+#include "mihomo_manager.h"
 #include <stdio.h>
+#include <string>
+#include <vector>
+
+extern MihomoManager* g_mihomoManager;
 
 TrayIcon::TrayIcon(HWND hwnd) : m_hwnd(hwnd), m_iconEnabled(NULL), m_iconDisabled(NULL), m_tunEnabled(false) {
     ZeroMemory(&m_nid, sizeof(m_nid));
@@ -14,11 +19,9 @@ TrayIcon::~TrayIcon() {
 }
 
 bool TrayIcon::LoadIcons() {
-    // 从资源加载自定义图标
     m_iconEnabled = LoadIconA(GetModuleHandle(NULL), MAKEINTRESOURCEA(IDI_PROXY_ON));
     m_iconDisabled = LoadIconA(GetModuleHandle(NULL), MAKEINTRESOURCEA(IDI_PROXY_OFF));
 
-    // 如果自定义图标加载失败，使用系统图标作为后备
     if (m_iconEnabled == NULL) {
         printf("Warning: Failed to load IDI_PROXY_ON, using system icon\n");
         m_iconEnabled = LoadIcon(NULL, IDI_INFORMATION);
@@ -31,11 +34,6 @@ bool TrayIcon::LoadIcons() {
     return (m_iconEnabled != NULL) && (m_iconDisabled != NULL);
 }
 
-HICON TrayIcon::CreateColorIcon(COLORREF color) {
-    // 此函数已弃用，保留以免编译错误
-    return LoadIcon(NULL, IDI_APPLICATION);
-}
-
 bool TrayIcon::Add() {
     m_nid.cbSize = sizeof(NOTIFYICONDATAA);
     m_nid.hWnd = m_hwnd;
@@ -43,7 +41,7 @@ bool TrayIcon::Add() {
     m_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     m_nid.uCallbackMessage = WM_TRAY_ICON;
     m_nid.hIcon = m_iconDisabled;
-    strcpy_s(m_nid.szTip, "系统代理 - 已关闭");
+    strcpy_s(m_nid.szTip, "ClashMetaX - 已关闭");
 
     return Shell_NotifyIconA(NIM_ADD, &m_nid) != FALSE;
 }
@@ -56,7 +54,7 @@ bool TrayIcon::Remove() {
 bool TrayIcon::Update(bool proxyEnabled) {
     m_nid.uFlags = NIF_ICON | NIF_TIP;
     m_nid.hIcon = proxyEnabled ? m_iconEnabled : m_iconDisabled;
-    strcpy_s(m_nid.szTip, proxyEnabled ? "系统代理 - 已开启" : "系统代理 - 已关闭");
+    strcpy_s(m_nid.szTip, proxyEnabled ? "ClashMetaX - 代理已开启" : "ClashMetaX - 代理已关闭");
 
     return Shell_NotifyIconA(NIM_MODIFY, &m_nid) != FALSE;
 }
@@ -76,6 +74,36 @@ void TrayIcon::ShowContextMenu() {
     AppendMenuA(hMenu, MF_STRING, IDM_SETTINGS, "设置...");
     AppendMenuA(hMenu, MF_STRING, IDM_AUTOSTART, "开机自启动");
     AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
+
+    HMENU kernelMenu = CreatePopupMenu();
+    std::string currentVersion = "未安装";
+    if (g_mihomoManager) {
+        KernelMetadata current = g_mihomoManager->GetCurrentKernel();
+        if (!current.version.empty()) {
+            currentVersion = current.version;
+        }
+        std::vector<KernelMetadata> kernels = g_mihomoManager->GetInstalledKernels();
+        for (size_t i = 0; i < kernels.size() && i < (IDM_KERNEL_MAX - IDM_KERNEL_BASE + 1); ++i) {
+            UINT flags = MF_STRING;
+            if (kernels[i].id == current.id) {
+                flags |= MF_CHECKED;
+            }
+            std::string item = kernels[i].version + " (" + kernels[i].id + ")";
+            AppendMenuA(kernelMenu, flags, IDM_KERNEL_BASE + static_cast<UINT>(i), item.c_str());
+        }
+        if (kernels.empty()) {
+            AppendMenuA(kernelMenu, MF_STRING | MF_GRAYED, IDM_KERNEL_BASE, "暂无已安装内核");
+        }
+    }
+
+    std::string currentText = "当前内核: " + currentVersion;
+    AppendMenuA(kernelMenu, MF_STRING | MF_GRAYED, 0, currentText.c_str());
+    AppendMenuA(kernelMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(kernelMenu, MF_STRING, IDM_DOWNLOAD_LATEST_KERNEL, "下载最新稳定版内核");
+    AppendMenuA(kernelMenu, MF_STRING, IDM_OPEN_KERNEL_DIR, "打开内核目录");
+    AppendMenuA(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(kernelMenu), "内核");
+
+    AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hMenu, MF_STRING, IDM_OPEN_WEBUI, "打开面板");
     AppendMenuA(hMenu, MF_STRING, IDM_RESTART_MIHOMO, "重启 Mihomo");
     AppendMenuA(hMenu, MF_STRING, IDM_OPEN_CONFIG_DIR, "打开配置文件");
@@ -93,7 +121,6 @@ LRESULT TrayIcon::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         if (lParam == WM_RBUTTONUP) {
             ShowContextMenu();
         } else if (lParam == WM_LBUTTONDOWN) {
-            // 单击左键：打开 webui
             PostMessage(m_hwnd, WM_COMMAND, IDM_OPEN_WEBUI, 0);
         } else if (lParam == WM_LBUTTONDBLCLK) {
             PostMessage(m_hwnd, WM_COMMAND, IDM_TOGGLE_PROXY, 0);
@@ -101,18 +128,7 @@ LRESULT TrayIcon::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         break;
 
     case WM_COMMAND:
-        switch (LOWORD(wParam)) {
-        case IDM_TOGGLE_PROXY:
-        case IDM_TOGGLE_TUN:
-        case IDM_SETTINGS:
-        case IDM_AUTOSTART:
-        case IDM_OPEN_WEBUI:
-        case IDM_RESTART_MIHOMO:
-        case IDM_OPEN_CONFIG_DIR:
-        case IDM_EXIT:
-            PostMessage(m_hwnd, WM_COMMAND, wParam, lParam);
-            break;
-        }
+        PostMessage(m_hwnd, WM_COMMAND, wParam, lParam);
         break;
     }
     return 0;

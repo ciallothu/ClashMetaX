@@ -1,8 +1,15 @@
 #pragma once
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <windows.h>
 #include <shellapi.h>
-#include <string>
 
 #define ID_TRAY_ICON 1001
 #define WM_TRAY_ICON (WM_USER + 1)
@@ -16,6 +23,10 @@
 #define IDM_UPDATE_MIHOMO 2007
 #define IDM_OPEN_CONFIG_DIR 2008
 #define IDM_TOGGLE_TUN 2009
+#define IDM_OPEN_KERNEL_DIR 2010
+#define IDM_DOWNLOAD_LATEST_KERNEL 2011
+#define IDM_KERNEL_BASE 2200
+#define IDM_KERNEL_MAX 2299
 
 class TrayIcon {
 public:
@@ -37,5 +48,4 @@ private:
 
     bool LoadIcons();
     void ShowContextMenu();
-    HICON CreateColorIcon(COLORREF color);
 };
