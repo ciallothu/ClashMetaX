@@ -52,3 +52,6 @@ docs
 # pixi
 .pixi/*
 !.pixi/config.toml
+
+# Generated icon assets
+src/res/icons/*.ico
